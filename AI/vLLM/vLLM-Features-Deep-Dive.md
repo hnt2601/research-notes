@@ -8,7 +8,8 @@
 5. [Chunked Prefill Scheduling](#4-chunked-prefill-scheduling)
 6. [Automatic Prefix Caching](#5-automatic-prefix-caching)
 7. [Model Quantization với LLM Compressor](#6-model-quantization-với-llm-compressor)
-8. [Kết Luận và So Sánh](#kết-luận-và-so-sánh)
+8. [Context Parallelism](#7-context-parallelism)
+9. [Kết Luận và So Sánh](#kết-luận-và-so-sánh)
 
 ---
 
@@ -23,6 +24,7 @@
 3. **Batching Inefficiency**: Static batching yêu cầu chờ toàn bộ batch hoàn thành, dẫn đến latency cao
 4. **Distributed Complexity**: Việc deploy models lớn trên nhiều GPUs phức tạp
 5. **Redundant Computation**: Các requests có prefix giống nhau vẫn phải tính toán lại từ đầu
+6. **Long Context Bottleneck**: Context length rất lớn (100K-1M tokens) gây ra memory và latency bottleneck
 
 ### Kiến Trúc Tổng Quan
 
@@ -2650,6 +2652,754 @@ Emerging quantization techniques:
 
 ---
 
+## 7. Context Parallelism
+
+### 7.1. Vấn Đề: Long Context Bottleneck
+
+Khi context length tăng lên rất lớn (100K - 1M tokens), các chiến lược parallelism hiện tại gặp hạn chế:
+
+```
+Long Context Challenges:
+
+Input: 1M tokens context
+Model: LLaMA-2 70B
+
+Problems:
+1. KV Cache Size:
+   - 1M tokens × 70B model → ~280 GB KV cache (chỉ riêng cache!)
+   - Không fit vào 1 GPU (A100 80GB)
+
+2. Prefill Computation:
+   - Attention: O(N²) complexity (N = context length)
+   - 1M tokens: 1T operations
+   - Single GPU: ~30-60 seconds prefill latency
+
+3. Tensor Parallelism Limitation:
+   - TP shards model weights, NOT context
+   - KV cache still full on each GPU
+   - Communication overhead increases with context length
+```
+
+**Observation:** TP, PP, DP không giải quyết vấn đề long context hiệu quả.
+
+**Giải Pháp:** Context Parallelism (CP) - Shard context/sequence length dimension.
+
+### 7.2. Context Parallelism: Core Idea
+
+#### Concept
+
+Thay vì shard model (TP) hoặc layers (PP), Context Parallelism **shards sequence/context dimension** (T dimension).
+
+```
+Traditional Tensor Parallelism (TP):
+Input: [Batch, SeqLen, HiddenDim]
+Split HiddenDim across GPUs
+
+Context Parallelism (CP):
+Input: [Batch, SeqLen, HiddenDim]
+Split SeqLen across GPUs
+```
+
+**Visual Comparison:**
+
+```
+Tensor Parallelism (TP=4):
+Sequence: [Token 0, Token 1, ..., Token 1M]
+          ↓
+Each GPU processes ALL tokens, but split hidden_dim:
+
+GPU0: [Token 0-1M] with hidden_dim[0:256]
+GPU1: [Token 0-1M] with hidden_dim[256:512]
+GPU2: [Token 0-1M] with hidden_dim[512:768]
+GPU3: [Token 0-1M] with hidden_dim[768:1024]
+
+KV Cache per GPU: 1M tokens (full sequence)
+
+---
+
+Context Parallelism (CP=4):
+Sequence: [Token 0, Token 1, ..., Token 1M]
+          ↓ Split by sequence length
+GPU0: [Token 0-250K]     with full hidden_dim
+GPU1: [Token 250K-500K]  with full hidden_dim
+GPU2: [Token 500K-750K]  with full hidden_dim
+GPU3: [Token 750K-1M]    with full hidden_dim
+
+KV Cache per GPU: 250K tokens (1/4 of sequence)
+```
+
+### 7.3. Context Parallelism Mechanisms
+
+#### 7.3.1. Prefill Context Parallelism
+
+Trong **prefill phase**, cả Q, K, V đều được shard theo sequence dimension.
+
+##### Approach 1: All-Gather Strategy (Short Context)
+
+```python
+class PrefillContextParallelAttention:
+    def __init__(self, cp_size=4):
+        self.cp_size = cp_size
+        self.cp_rank = get_cp_rank()
+
+    def forward(self, q, k, v):
+        """
+        Input (per GPU):
+            q: (batch, seq_len/cp_size, num_heads, head_dim)
+            k: (batch, seq_len/cp_size, num_heads, head_dim)
+            v: (batch, seq_len/cp_size, num_heads, head_dim)
+
+        Strategy:
+            1. Each GPU holds partial Q, K, V (split by seq_len)
+            2. All-gather K, V to get full context
+            3. Compute local attention for local Q chunk
+            4. Concatenate outputs
+        """
+        # Step 1: All-gather K, V across CP group
+        k_full = all_gather(k, dim=1, group=cp_group)
+        # k_full: (batch, seq_len, num_heads, head_dim)
+
+        v_full = all_gather(v, dim=1, group=cp_group)
+        # v_full: (batch, seq_len, num_heads, head_dim)
+
+        # Step 2: Compute attention for local Q chunk
+        # Q[i] can attend to ALL K, V (full context)
+        attn_scores = torch.matmul(q, k_full.transpose(-2, -1))
+        # attn_scores: (batch, seq_len/cp_size, num_heads, seq_len)
+
+        attn_weights = F.softmax(attn_scores / sqrt(head_dim), dim=-1)
+
+        output = torch.matmul(attn_weights, v_full)
+        # output: (batch, seq_len/cp_size, num_heads, head_dim)
+
+        # Step 3: Each GPU returns its chunk of output
+        return output
+```
+
+**Timeline:**
+
+```
+All-Gather Prefill CP (CP=4, seq_len=1M):
+
+Step 1: All-Gather K, V
+GPU0: Send K[0:250K], V[0:250K] → All GPUs
+GPU1: Send K[250K:500K], V[250K:500K] → All GPUs
+GPU2: Send K[500K:750K], V[500K:750K] → All GPUs
+GPU3: Send K[750K:1M], V[750K:1M] → All GPUs
+
+Step 2: Compute local attention
+GPU0: Q[0:250K] @ K[0:1M] → Attention[0:250K]
+GPU1: Q[250K:500K] @ K[0:1M] → Attention[250K:500K]
+GPU2: Q[500K:750K] @ K[0:1M] → Attention[500K:750K]
+GPU3: Q[750K:1M] @ K[0:1M] → Attention[750K:1M]
+
+Step 3: Concatenate outputs
+Output: [Attention[0:250K], Attention[250K:500K], ...]
+
+Pros:
+✅ Simple implementation
+✅ Good for moderate context lengths
+
+Cons:
+❌ All-gather requires holding full K, V in memory
+❌ Memory bottleneck for very long context (>1M tokens)
+```
+
+##### Approach 2: Ring Attention (Very Long Context)
+
+Khi context quá dài, không thể all-gather toàn bộ K, V. **Ring Attention** giải quyết bằng cách:
+
+```
+Ring Attention Idea:
+- Each GPU computes attention incrementally
+- K, V chunks are passed in a ring pattern
+- Accumulate partial attention results
+
+Inspired by: "Ring Attention with Blockwise Transformers" (Liu et al., 2023)
+```
+
+**Implementation:**
+
+```python
+class RingAttention:
+    def __init__(self, cp_size=4):
+        self.cp_size = cp_size
+        self.cp_rank = get_cp_rank()
+
+    def forward(self, q, k, v):
+        """
+        Ring Attention for very long context
+
+        Each GPU:
+        1. Holds local Q, K, V chunks
+        2. Iteratively receives K, V from neighbors
+        3. Computes partial attention and accumulates
+        4. Passes K, V to next GPU in ring
+        """
+        batch, seq_chunk, num_heads, head_dim = q.shape
+
+        # Initialize output and normalizer
+        output = torch.zeros_like(q)
+        lse = torch.zeros(batch, seq_chunk, num_heads)  # log-sum-exp
+
+        # Current K, V chunks (initially local)
+        k_current = k.clone()
+        v_current = v.clone()
+
+        # Ring iterations: receive K, V from all GPUs
+        for step in range(self.cp_size):
+            # Step 1: Compute attention with current K, V chunk
+            attn_scores = torch.matmul(q, k_current.transpose(-2, -1))
+            attn_scores = attn_scores / sqrt(head_dim)
+
+            # Compute log-sum-exp for numerical stability
+            max_scores = attn_scores.max(dim=-1, keepdim=True).values
+            exp_scores = torch.exp(attn_scores - max_scores)
+
+            # Step 2: Accumulate partial attention
+            # Using online softmax (numerically stable)
+            new_lse = torch.log(torch.exp(lse - max_scores.squeeze(-1)) +
+                                 exp_scores.sum(dim=-1))
+
+            # Update output with weighted average
+            attn_weights = exp_scores / exp_scores.sum(dim=-1, keepdim=True)
+            partial_output = torch.matmul(attn_weights, v_current)
+
+            # Merge with previous output
+            old_weight = torch.exp(lse - new_lse).unsqueeze(-1)
+            new_weight = torch.exp(max_scores.squeeze(-1) - new_lse).unsqueeze(-1)
+
+            output = output * old_weight + partial_output * new_weight
+            lse = new_lse
+
+            # Step 3: Send current K, V to next GPU, receive from previous
+            if step < self.cp_size - 1:
+                k_current = ring_send_recv(k_current, src=prev_rank, dst=next_rank)
+                v_current = ring_send_recv(v_current, src=prev_rank, dst=next_rank)
+
+        return output
+
+def ring_send_recv(tensor, src, dst):
+    """
+    Send tensor to dst, receive from src in ring pattern
+    Uses PyTorch distributed primitives
+    """
+    send_op = dist.P2POp(dist.isend, tensor, dst)
+    recv_tensor = torch.empty_like(tensor)
+    recv_op = dist.P2POp(dist.irecv, recv_tensor, src)
+
+    reqs = dist.batch_isend_irecv([send_op, recv_op])
+    for req in reqs:
+        req.wait()
+
+    return recv_tensor
+```
+
+**Ring Attention Timeline:**
+
+```
+Ring Attention (CP=4, seq_len=1M):
+
+Initial state:
+GPU0: Q[0:250K], K[0:250K], V[0:250K]
+GPU1: Q[250K:500K], K[250K:500K], V[250K:500K]
+GPU2: Q[500K:750K], K[500K:750K], V[500K:750K]
+GPU3: Q[750K:1M], K[750K:1M], V[750K:1M]
+
+Iteration 1: Compute with local K, V
+GPU0: Attention(Q[0:250K], K[0:250K], V[0:250K]) → partial_output_0
+GPU1: Attention(Q[250K:500K], K[250K:500K], V[250K:500K]) → partial_output_1
+...
+
+Iteration 2: Ring shift K, V
+GPU0 receives K[750K:1M], V[750K:1M] from GPU3
+GPU1 receives K[0:250K], V[0:250K] from GPU0
+GPU2 receives K[250K:500K], V[250K:500K] from GPU1
+GPU3 receives K[500K:750K], V[500K:750K] from GPU2
+
+GPU0: Attention(Q[0:250K], K[750K:1M], V[750K:1M]) → accumulate
+...
+
+Iteration 3: Ring shift again
+GPU0 receives K[500K:750K], V[500K:750K] from GPU2
+...
+
+Iteration 4: Final ring shift
+GPU0 receives K[250K:500K], V[250K:500K] from GPU1
+...
+
+Result: Each GPU has computed full attention for its Q chunk
+
+Pros:
+✅ Constant memory per GPU (no all-gather)
+✅ Supports arbitrarily long context (1M+ tokens)
+✅ Memory efficient: each GPU holds only 1/cp_size of KV cache
+
+Cons:
+❌ More complex implementation
+❌ Communication overhead (cp_size iterations)
+❌ Slightly higher latency than all-gather (for moderate context)
+```
+
+**Memory Analysis:**
+
+```
+Context Length = 1M tokens
+Hidden Dim = 4096
+CP Size = 4
+
+All-Gather Approach:
+Per GPU Memory:
+- Local Q: 250K × 4096 = 1 GB
+- Full K, V (after all-gather): 2 × 1M × 4096 = 8 GB
+Total: ~9 GB per GPU
+
+Ring Attention:
+Per GPU Memory:
+- Local Q: 250K × 4096 = 1 GB
+- Local K, V: 2 × 250K × 4096 = 2 GB
+Total: ~3 GB per GPU
+
+Savings: 9 GB / 3 GB = 3x memory reduction
+```
+
+#### 7.3.2. Decode Context Parallelism
+
+Trong **decode phase**, chỉ có 1 query token mới, nhưng phải attend to toàn bộ KV cache.
+
+##### Strategy: Sharded KV Cache với All-Reduce
+
+```python
+class DecodeContextParallelAttention:
+    def __init__(self, cp_size=4):
+        self.cp_size = cp_size
+        self.cp_rank = get_cp_rank()
+
+    def forward(self, q, kv_cache_shard):
+        """
+        Decode phase with CP
+
+        Input:
+            q: (batch, 1, num_heads, head_dim) - single new token
+            kv_cache_shard: (batch, seq_len/cp_size, num_heads, head_dim)
+                            - local shard of KV cache
+
+        Strategy:
+            1. Compute partial attention with local KV shard
+            2. All-reduce to combine results from all GPUs
+        """
+        # Step 1: Compute attention with local KV shard
+        k_shard, v_shard = kv_cache_shard
+
+        attn_scores = torch.matmul(q, k_shard.transpose(-2, -1))
+        # attn_scores: (batch, 1, num_heads, seq_len/cp_size)
+
+        attn_scores = attn_scores / sqrt(head_dim)
+
+        # Step 2: Compute log-sum-exp (for numerical stability)
+        max_score = attn_scores.max(dim=-1, keepdim=True).values
+        # max_score: (batch, 1, num_heads, 1)
+
+        # All-reduce to get global max
+        global_max = all_reduce(max_score, op=ReduceOp.MAX, group=cp_group)
+
+        # Step 3: Compute exp and partial sum
+        exp_scores = torch.exp(attn_scores - global_max)
+        local_sum = exp_scores.sum(dim=-1, keepdim=True)
+
+        # All-reduce to get global sum
+        global_sum = all_reduce(local_sum, op=ReduceOp.SUM, group=cp_group)
+
+        # Step 4: Compute local attention output
+        local_output = torch.matmul(exp_scores, v_shard)
+        # local_output: (batch, 1, num_heads, head_dim)
+
+        # Step 5: All-reduce to combine outputs
+        global_output = all_reduce(local_output, op=ReduceOp.SUM, group=cp_group)
+
+        # Step 6: Normalize
+        final_output = global_output / global_sum
+
+        return final_output
+```
+
+**KV Cache Distribution:**
+
+```
+Decode CP (CP=4, cached_len=1M):
+
+KV Cache Distribution (round-robin):
+Token 0 → GPU 0
+Token 1 → GPU 1
+Token 2 → GPU 2
+Token 3 → GPU 3
+Token 4 → GPU 0  (wrap around)
+...
+
+After 1M tokens:
+GPU 0: KV[0, 4, 8, 12, ..., 999996] (250K tokens)
+GPU 1: KV[1, 5, 9, 13, ..., 999997] (250K tokens)
+GPU 2: KV[2, 6, 10, 14, ..., 999998] (250K tokens)
+GPU 3: KV[3, 7, 11, 15, ..., 999999] (250K tokens)
+
+New token decode:
+Query: (batch, 1, num_heads, head_dim)
+
+GPU 0: Attention(Q, KV[0, 4, 8, ...]) → partial_output_0
+GPU 1: Attention(Q, KV[1, 5, 9, ...]) → partial_output_1
+GPU 2: Attention(Q, KV[2, 6, 10, ...]) → partial_output_2
+GPU 3: Attention(Q, KV[3, 7, 11, ...]) → partial_output_3
+
+All-Reduce: Sum all partial outputs → final output
+```
+
+### 7.4. Hybrid Parallelism: TP + CP
+
+Context Parallelism thường được **kết hợp với Tensor Parallelism** (TP).
+
+```python
+# Hybrid TP + CP
+# Example: TP=2, CP=4 (total 8 GPUs)
+
+class HybridTPCPAttention:
+    def __init__(self, tp_size=2, cp_size=4):
+        self.tp_size = tp_size
+        self.cp_size = cp_size
+        self.tp_rank = get_tp_rank()
+        self.cp_rank = get_cp_rank()
+
+    def forward(self, x):
+        # x: (batch, seq_len/cp_size, hidden_dim)
+
+        # Step 1: QKV projection (TP column parallel)
+        qkv = self.qkv_proj(x)  # Column parallel (TP)
+        # qkv: (batch, seq_len/cp_size, 3*num_heads_per_tp*head_dim)
+
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # Step 2: Attention (CP across sequence)
+        if self.is_prefill:
+            output = ring_attention(q, k, v, cp_group=self.cp_group)
+        else:
+            output = decode_cp_attention(q, k, v, cp_group=self.cp_group)
+
+        # Step 3: Output projection (TP row parallel)
+        output = self.o_proj(output)  # Row parallel (TP), all-reduce inside
+
+        return output
+```
+
+**GPU Layout:**
+
+```
+8 GPUs: TP=2, CP=4
+
+CP Group 0:
+  GPU 0 (TP rank 0, CP rank 0): Sequence[0:250K], hidden_dim[0:2048]
+  GPU 2 (TP rank 0, CP rank 1): Sequence[250K:500K], hidden_dim[0:2048]
+  GPU 4 (TP rank 0, CP rank 2): Sequence[500K:750K], hidden_dim[0:2048]
+  GPU 6 (TP rank 0, CP rank 3): Sequence[750K:1M], hidden_dim[0:2048]
+
+CP Group 1:
+  GPU 1 (TP rank 1, CP rank 0): Sequence[0:250K], hidden_dim[2048:4096]
+  GPU 3 (TP rank 1, CP rank 1): Sequence[250K:500K], hidden_dim[2048:4096]
+  GPU 5 (TP rank 1, CP rank 2): Sequence[500K:750K], hidden_dim[2048:4096]
+  GPU 7 (TP rank 1, CP rank 3): Sequence[750K:1M], hidden_dim[2048:4096]
+
+Communication Pattern:
+- CP: Ring communication within CP group (for attention)
+- TP: All-reduce within TP group (for linear layers)
+```
+
+### 7.5. Configuration và Usage
+
+#### vLLM Command Line
+
+```bash
+# Enable Context Parallelism in vLLM
+
+# Basic CP (CP=4)
+vllm serve meta-llama/Llama-2-7b-hf \
+    --tensor-parallel-size 1 \
+    --context-parallel-size 4
+
+# Hybrid TP + CP (TP=2, CP=4, total 8 GPUs)
+vllm serve meta-llama/Llama-2-70b-hf \
+    --tensor-parallel-size 2 \
+    --context-parallel-size 4
+
+# With long context
+vllm serve gradientai/Llama-3-70B-Instruct-Gradient-1048k \
+    --tensor-parallel-size 4 \
+    --context-parallel-size 4 \
+    --max-model-len 1048576  # 1M context
+```
+
+#### Python API
+
+```python
+from vllm import LLM, SamplingParams
+
+# Initialize with CP
+llm = LLM(
+    model="meta-llama/Llama-2-70b-hf",
+    tensor_parallel_size=2,
+    context_parallel_size=4,  # Enable CP
+    max_model_len=262144,     # 256K context
+    gpu_memory_utilization=0.95,
+)
+
+# Long context inference
+prompt = "..." * 100000  # Very long prompt
+sampling_params = SamplingParams(temperature=0.7, max_tokens=100)
+
+outputs = llm.generate([prompt], sampling_params)
+print(outputs[0].outputs[0].text)
+```
+
+### 7.6. Performance Analysis
+
+#### Memory Savings
+
+```
+Benchmark: LLaMA-2 70B, Context Length = 1M tokens
+
+Without CP (TP=8):
+Per GPU:
+- Model weights: 70B / 8 = 8.75B params × 2 bytes = 17.5 GB
+- KV cache: 1M tokens × 8192 hidden × 2 bytes = 16 GB
+- Activations: ~5 GB
+Total per GPU: ~38.5 GB
+Total across 8 GPUs: 308 GB
+
+With CP=4, TP=2 (8 GPUs):
+Per GPU:
+- Model weights: 70B / 2 = 35B params × 2 bytes = 70 GB / 4 (TP) = 17.5 GB
+- KV cache: (1M / 4) tokens × 8192 hidden × 2 bytes = 4 GB
+- Activations: ~5 GB
+Total per GPU: ~26.5 GB
+Total across 8 GPUs: 212 GB
+
+Savings: 308 GB → 212 GB (31% reduction)
+```
+
+#### Latency Analysis
+
+```
+Prefill Latency (1M tokens, LLaMA-2 70B):
+
+TP=8 only:
+- Attention: O(N²) on each GPU
+- Time: ~45 seconds
+
+TP=2, CP=4 (Ring Attention):
+- Attention: O((N/4)²) per GPU, but 4 ring iterations
+- Communication: 4 × (P2P latency)
+- Time: ~18 seconds
+
+Speedup: 2.5x faster
+
+Decode Latency (1M context):
+TP=8 only:
+- KV cache: 16 GB per GPU
+- Memory BW limited: ~25 ms/token
+
+TP=2, CP=4:
+- KV cache: 4 GB per GPU
+- Memory BW limited: ~15 ms/token
+- All-reduce overhead: +2 ms
+- Total: ~17 ms/token
+
+Speedup: 1.5x faster
+```
+
+### 7.7. Use Cases
+
+#### 1. Long Document QA
+
+```python
+# Scenario: Q&A over 500-page document
+document = load_document("long_report.pdf")  # ~200K tokens
+
+llm = LLM(
+    model="meta-llama/Llama-2-70b-hf",
+    tensor_parallel_size=2,
+    context_parallel_size=4,
+    max_model_len=262144,
+)
+
+prompt = f"{document}\n\nQuestion: Summarize the key findings."
+output = llm.generate([prompt])
+```
+
+#### 2. Multi-Document RAG
+
+```python
+# Scenario: RAG with 50 retrieved documents
+documents = retrieve_documents(query, top_k=50)  # ~100K tokens total
+context = "\n\n".join(documents)
+
+llm = LLM(
+    model="meta-llama/Llama-3-70B-Instruct",
+    tensor_parallel_size=4,
+    context_parallel_size=2,
+    max_model_len=131072,
+)
+
+prompt = f"Context:\n{context}\n\nQuestion: {query}"
+output = llm.generate([prompt])
+```
+
+#### 3. Long Conversation History
+
+```python
+# Scenario: Multi-turn conversation with full history
+conversation_history = load_conversation()  # 50K tokens
+
+llm = LLM(
+    model="meta-llama/Llama-2-13b-hf",
+    tensor_parallel_size=1,
+    context_parallel_size=2,
+    max_model_len=65536,
+)
+
+new_message = "Tell me more about that topic."
+full_prompt = f"{conversation_history}\nUser: {new_message}\nAssistant:"
+output = llm.generate([full_prompt])
+```
+
+### 7.8. Limitations và Best Practices
+
+#### Limitations
+
+1. **Communication Overhead:**
+   - Ring Attention requires `cp_size` iterations
+   - Not beneficial for short context (<64K tokens)
+
+2. **Implementation Complexity:**
+   - More complex than TP/PP
+   - Debugging distributed attention is harder
+
+3. **Model Support:**
+   - Not all models support CP yet
+   - Requires specific attention implementation
+
+#### Best Practices
+
+```python
+# When to use CP:
+
+if context_length > 100_000:
+    # Very long context → CP highly recommended
+    cp_size = 4 or 8
+
+elif context_length > 32_000:
+    # Long context → CP beneficial
+    cp_size = 2 or 4
+
+else:
+    # Normal context → CP not needed
+    cp_size = 1  # Disabled
+
+# Tuning CP size:
+# - cp_size = 2: Minimal overhead, good for 32K-128K
+# - cp_size = 4: Balanced, good for 128K-512K
+# - cp_size = 8: Aggressive, good for 512K-2M
+
+# Combine with TP:
+if model_size > 70B:
+    # Large model → Use both TP and CP
+    tp_size = 4
+    cp_size = 4
+else:
+    # Smaller model → CP only
+    tp_size = 1
+    cp_size = 4
+
+# Memory tuning:
+gpu_memory_utilization = 0.9  # Leave room for activation
+```
+
+#### Configuration Examples
+
+```python
+# Example 1: Long document (256K context)
+# Model: LLaMA-2 70B
+# Hardware: 8×A100 80GB
+
+llm = LLM(
+    model="meta-llama/Llama-2-70b-hf",
+    tensor_parallel_size=2,   # TP for model size
+    context_parallel_size=4,  # CP for context length
+    max_model_len=262144,
+    gpu_memory_utilization=0.9,
+)
+
+# Example 2: Extreme long context (1M tokens)
+# Model: Gradient Llama-3 70B 1M
+# Hardware: 16×A100 80GB
+
+llm = LLM(
+    model="gradientai/Llama-3-70B-Instruct-Gradient-1048k",
+    tensor_parallel_size=4,   # TP=4 for model
+    context_parallel_size=4,  # CP=4 for context
+    max_model_len=1048576,    # 1M context
+    gpu_memory_utilization=0.95,
+)
+
+# Example 3: Moderate context, smaller model
+# Model: LLaMA-2 13B
+# Context: 128K tokens
+# Hardware: 4×A100 40GB
+
+llm = LLM(
+    model="meta-llama/Llama-2-13b-hf",
+    tensor_parallel_size=1,   # Model fits 1 GPU
+    context_parallel_size=4,  # CP=4 for long context
+    max_model_len=131072,
+    gpu_memory_utilization=0.85,
+)
+```
+
+### 7.9. Comparison with Other Approaches
+
+| Approach | Context Scaling | Memory | Latency | Complexity |
+|----------|----------------|--------|---------|------------|
+| **Vanilla Attention** | O(N²) | N | O(N²) | Low |
+| **Flash Attention** | O(N²) optimized | N | O(N²) faster | Medium |
+| **Tensor Parallel** | O(N²) | N (replicated) | O(N²) | Medium |
+| **Context Parallel (CP)** | O((N/k)²) per GPU | N/k | O((N/k)²) + comm | High |
+| **Ring Attention** | O((N/k)²) per GPU | N/k | O((N/k)²) + k×comm | Very High |
+
+**When to Use:**
+
+- **Context < 32K:** Standard TP (no CP needed)
+- **32K < Context < 128K:** CP=2 or CP=4 (moderate benefit)
+- **128K < Context < 1M:** CP=4 or CP=8 (high benefit)
+- **Context > 1M:** CP=8+ with Ring Attention (essential)
+
+### 7.10. Future Directions
+
+Emerging techniques for long context:
+
+1. **Hybrid CP + Sparse Attention:**
+   - Combine CP with attention sparsity patterns
+   - Reduce computation from O(N²) to O(N log N)
+
+2. **Hierarchical Context Parallelism:**
+   - Multi-level CP (e.g., CP across nodes, TP within nodes)
+   - Better scaling for multi-node deployments
+
+3. **Adaptive CP:**
+   - Dynamically adjust cp_size based on runtime context length
+   - Overhead reduction for variable-length inputs
+
+4. **KV Cache Compression with CP:**
+   - Compress KV cache within each CP shard
+   - Further memory savings
+
+---
+
 ## Kết Luận và So Sánh
 
 ### Tổng Quan Các Tính Năng
@@ -2662,6 +3412,7 @@ Emerging quantization techniques:
 | **Chunked Prefill** | Prefill/decode imbalance | Decode latency ổn định, throughput +50% | Prefill chậm hơn một chút |
 | **Prefix Caching** | Redundant computation | TTFT 3-5x nhanh hơn cho requests có chung prefix | Memory overhead nhỏ |
 | **Quantization** | High memory usage, expensive hardware | Memory 2-4x reduction, cost 50-75% lower | Accuracy degradation 2-8% |
+| **Context Parallelism** | Long context (100K-1M tokens), KV cache bottleneck | Memory 3x reduction, latency 2-3x faster cho long context | Communication overhead, chỉ hiệu quả với long context |
 
 ### Khi Nào Dùng vLLM?
 
