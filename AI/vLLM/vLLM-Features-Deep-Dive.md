@@ -9,7 +9,8 @@
 6. [Automatic Prefix Caching](#5-automatic-prefix-caching)
 7. [Model Quantization với LLM Compressor](#6-model-quantization-với-llm-compressor)
 8. [Context Parallelism](#7-context-parallelism)
-9. [Kết Luận và So Sánh](#kết-luận-và-so-sánh)
+9. [Disaggregated Prefill and Decode](#8-disaggregated-prefill-and-decode)
+10. [Kết Luận và So Sánh](#kết-luận-và-so-sánh)
 
 ---
 
@@ -3400,6 +3401,674 @@ Emerging techniques for long context:
 
 ---
 
+## 8. Disaggregated Prefill and Decode
+
+### 8.1. Vấn Đề: Phase Interference và Resource Mismatch
+
+LLM inference có 2 phases với đặc điểm **trái ngược nhau**:
+
+```python
+# Phase 1: Prefill (Process Input Prompt)
+def prefill_phase(prompt_tokens):
+    """
+    - Process nhiều tokens cùng lúc (100-10,000+ tokens)
+    - Compute-bound (matmul intensive)
+    - High throughput
+    - Burstable workload
+    """
+    kv_cache = model.forward(prompt_tokens)  # e.g., 2048 tokens
+    return kv_cache
+
+# Phase 2: Decode (Generate Output)
+def decode_phase(kv_cache):
+    """
+    - Process 1 token mỗi iteration
+    - Memory-bandwidth-bound (load KV cache)
+    - Low latency requirement
+    - Continuous, predictable workload
+    """
+    for _ in range(max_new_tokens):
+        next_token = model.forward(last_token, kv_cache)  # 1 token
+        yield next_token
+```
+
+**Vấn Đề khi chạy chung trên cùng GPU:**
+
+```
+Monolithic System (Prefill + Decode cùng GPU):
+
+GPU Timeline:
+t=0:   [PREFILL────────────] (long, compute-intensive)
+t=50:  [D][D][D][D][D][D]... (decode blocked, high latency)
+t=100: [PREFILL────] (new request)
+t=120: [D][D][D]... (decode latency spikes)
+
+Problems:
+1. Phase Interference:
+   - Prefill blocks decode → high inter-token latency (ITL)
+   - Decode underutilizes GPU → low throughput
+
+2. Resource Mismatch:
+   - Prefill needs compute (SM cores)
+   - Decode needs bandwidth (memory BW)
+   - Cannot optimize for both simultaneously
+
+3. Tail ITL:
+   - P99 ITL can be 10-100x higher than median
+   - Unpredictable user experience
+```
+
+**Metrics:**
+
+```
+Monolithic vLLM (LLaMA-2 70B, mixed workload):
+
+Time to First Token (TTFT): 500-2000ms (high variance)
+Inter-Token Latency (ITL):
+  - Median: 30ms
+  - P99: 300ms (10x higher!)
+  - P99.9: 1000ms (blocked by long prefills)
+
+Throughput: 1500 tokens/sec
+GPU Utilization: 70-85% (imbalanced)
+```
+
+### 8.2. Giải Pháp: Disaggregated Prefill and Decode
+
+#### Ý Tưởng
+
+Chạy **2 vLLM instances riêng biệt**:
+
+1. **Prefill Instance**: Chuyên xử lý prefill phase
+2. **Decode Instance**: Chuyên xử lý decode phase
+
+```
+Disaggregated Architecture:
+
+┌─────────────────────────────────────────────────────────┐
+│                      Client Requests                     │
+└─────────────────────────────────────────────────────────┘
+                          ↓
+         ┌────────────────┴────────────────┐
+         ↓                                  ↓
+┌──────────────────────┐          ┌──────────────────────┐
+│   Prefill Instance   │          │   Decode Instance    │
+│  (GPU 0 or Cluster)  │          │  (GPU 1 or Cluster)  │
+├──────────────────────┤          ├──────────────────────┤
+│ • Process prompts    │   KV     │ • Generate tokens    │
+│ • Compute KV cache   │  Cache   │ • Use cached KV      │
+│ • Optimized for      │ Transfer │ • Optimized for      │
+│   compute throughput │─────────▶│   low latency        │
+│                      │          │                      │
+│ Config:              │          │ Config:              │
+│ • TP=4 (parallelism) │          │ • TP=2 (less memory) │
+│ • Large batch        │          │ • Small batch        │
+│ • No decode tasks    │          │ • No prefill tasks   │
+└──────────────────────┘          └──────────────────────┘
+```
+
+#### KV Cache Transfer Connector
+
+vLLM cung cấp **connector** để transfer KV cache từ prefill → decode instance:
+
+```python
+from vllm import LLM
+from vllm.distributed.kv_transfer.kv_connector import (
+    KVConnectorFactory,
+    KVConnectorConfig,
+)
+
+# === Prefill Instance ===
+prefill_config = KVConnectorConfig(
+    kv_role="kv_producer",           # Produce KV cache
+    kv_connector_type="TensorParallelConnector",
+    kv_buffer_size=1e9,              # 1GB buffer
+)
+
+prefill_llm = LLM(
+    model="meta-llama/Llama-2-70b-hf",
+    tensor_parallel_size=4,          # TP=4 for high compute
+    kv_connector_config=prefill_config,
+    # Only prefill, no decode
+    max_num_batched_tokens=16384,    # Large batch for prefill
+)
+
+# === Decode Instance ===
+decode_config = KVConnectorConfig(
+    kv_role="kv_consumer",           # Consume KV cache
+    kv_connector_type="TensorParallelConnector",
+    kv_buffer_size=1e9,
+)
+
+decode_llm = LLM(
+    model="meta-llama/Llama-2-70b-hf",
+    tensor_parallel_size=2,          # TP=2 (less parallelism needed)
+    kv_connector_config=decode_config,
+    # Only decode
+    max_num_seqs=256,                # Many concurrent decodes
+)
+```
+
+### 8.3. Cơ Chế Hoạt Động
+
+#### Request Flow
+
+```python
+# Step-by-step request processing
+
+# 1. Client sends request
+request = {
+    "prompt": "Explain quantum computing in simple terms.",
+    "max_tokens": 100,
+}
+
+# 2. Prefill Instance processes prompt
+prefill_output = prefill_llm.generate(
+    prompts=[request["prompt"]],
+    sampling_params=SamplingParams(max_tokens=0),  # Only prefill
+)
+
+# KV cache computed:
+# - kv_cache shape: (num_layers, batch, num_heads, seq_len, head_dim)
+# - For LLaMA-2 70B: ~2GB per request
+
+# 3. KV Cache Transfer (via connector)
+# - Prefill instance sends KV cache to decode instance
+# - Transfer mechanism: shared memory, RDMA, or TCP/IP
+# - Compressed format to reduce bandwidth
+
+connector.transfer_kv_cache(
+    request_id=request_id,
+    kv_cache=kv_cache,
+    metadata={
+        "prompt_tokens": prompt_tokens,
+        "num_layers": num_layers,
+    }
+)
+
+# 4. Decode Instance receives KV cache and generates
+decode_output = decode_llm.generate(
+    prompts=[request["prompt"]],      # Metadata only
+    kv_cache_from_prefill=kv_cache,   # Reuse prefill KV
+    sampling_params=SamplingParams(max_tokens=100),
+)
+
+# 5. Stream tokens back to client
+for token in decode_output:
+    yield token
+```
+
+#### Timeline Comparison
+
+```
+Monolithic (Single Instance):
+
+Request 1:
+├─ Prefill: [████████] 200ms
+└─ Decode:  [█][█][█][█]... (blocked by Request 2 prefill)
+             ↑  ↑  ↑  ↑
+            30ms 150ms (spike!) 35ms 40ms
+
+Request 2:
+├─ Prefill: [████████████] 400ms (blocks Request 1 decode)
+└─ Decode:  [█][█][█]...
+
+Problem: ITL spikes when prefills happen
+─────────────────────────────────────────────────────────
+
+Disaggregated (Separate Instances):
+
+Prefill Instance (GPU 0):
+Request 1: [████████] 200ms
+Request 2:           [████████████] 400ms
+Request 3:                         [██████] 150ms
+
+Decode Instance (GPU 1):
+Request 1:           [█][█][█][█][█][█]... (stable latency)
+                      ↑  ↑  ↑  ↑  ↑  ↑
+                     30ms 30ms 30ms 30ms 30ms
+Request 2:                         [█][█][█]...
+Request 3:                                   [█][█]...
+
+Benefit: Consistent ITL, no interference
+```
+
+### 8.4. Configuration và Optimization
+
+#### Prefill Instance Configuration
+
+```python
+prefill_llm = LLM(
+    model="meta-llama/Llama-2-70b-hf",
+
+    # Parallelism: High TP for compute throughput
+    tensor_parallel_size=4,          # More GPUs for compute
+
+    # Batching: Large batches for throughput
+    max_num_batched_tokens=16384,    # 16K tokens per batch
+    max_num_seqs=64,                 # Many concurrent prefills
+
+    # Memory: Less memory needed (no long-running sequences)
+    gpu_memory_utilization=0.95,
+
+    # No decode optimization needed
+    enable_chunked_prefill=False,    # Process entire prompts
+
+    # KV Transfer
+    kv_connector_config=KVConnectorConfig(
+        kv_role="kv_producer",
+        kv_connector_type="TensorParallelConnector",
+        kv_buffer_size=2e9,          # 2GB buffer for transfers
+    ),
+)
+```
+
+#### Decode Instance Configuration
+
+```python
+decode_llm = LLM(
+    model="meta-llama/Llama-2-70b-hf",
+
+    # Parallelism: Lower TP (decode is memory-bound)
+    tensor_parallel_size=2,          # Less parallelism needed
+
+    # Batching: Optimize for low latency
+    max_num_seqs=256,                # Many concurrent generations
+    max_num_batched_tokens=4096,     # Smaller batches for latency
+
+    # Memory: More memory for KV cache (many sequences)
+    gpu_memory_utilization=0.90,
+    enable_prefix_caching=True,      # Cache common prefixes
+
+    # Decode optimization
+    scheduler_config=SchedulerConfig(
+        max_model_len=4096,
+        # Prioritize fairness and low latency
+    ),
+
+    # KV Transfer
+    kv_connector_config=KVConnectorConfig(
+        kv_role="kv_consumer",
+        kv_connector_type="TensorParallelConnector",
+        kv_buffer_size=2e9,
+    ),
+)
+```
+
+### 8.5. KV Transfer Mechanisms
+
+#### 8.5.1. Shared Memory (Single Node)
+
+Fastest method khi prefill và decode instances trên cùng node:
+
+```python
+connector_config = KVConnectorConfig(
+    kv_connector_type="SharedMemoryConnector",
+    kv_role="kv_producer",  # or "kv_consumer"
+    kv_buffer_device="cpu",          # Use CPU shared memory
+    kv_buffer_size=5e9,              # 5GB shared memory pool
+)
+
+# Transfer via shared memory:
+# - Zero-copy (no data movement)
+# - Latency: <1ms
+# - Bandwidth: CPU memory bandwidth (~100 GB/s)
+```
+
+#### 8.5.2. RDMA (Multi-Node)
+
+Cho distributed deployments:
+
+```python
+connector_config = KVConnectorConfig(
+    kv_connector_type="RDMAConnector",
+    kv_role="kv_producer",
+    kv_buffer_size=2e9,
+    # RDMA-specific settings
+    rdma_device="mlx5_0",            # InfiniBand device
+    rdma_gid_index=0,
+)
+
+# Transfer via RDMA:
+# - Direct GPU-to-GPU transfer
+# - Latency: ~5-10ms
+# - Bandwidth: 100-200 GB/s (InfiniBand)
+```
+
+#### 8.5.3. TCP/IP (Cross-Region)
+
+Slowest nhưng linh hoạt nhất:
+
+```python
+connector_config = KVConnectorConfig(
+    kv_connector_type="TCPConnector",
+    kv_role="kv_consumer",
+    kv_connector_address="192.168.1.100:8000",
+    kv_buffer_size=1e9,
+    # Compression to reduce bandwidth
+    enable_compression=True,
+)
+
+# Transfer via TCP/IP:
+# - Latency: 10-100ms (network dependent)
+# - Bandwidth: 1-10 GB/s (network dependent)
+# - Compression: ~3x reduction in transfer size
+```
+
+### 8.6. Advanced Techniques: Intra-GPU Disaggregation
+
+#### Nexus System (Research: 2025)
+
+Thay vì dùng 2 GPUs riêng biệt, **Nexus** thực hiện disaggregation **trong cùng GPU**:
+
+```
+Traditional Disaggregation:
+GPU 0: [PPPPPPPPPPPP] (Prefill only)
+GPU 1: [DDDDDDDDDDDD] (Decode only)
+→ Resource waste (GPU 0 idle during decode-heavy periods)
+
+Intra-GPU Disaggregation (Nexus):
+GPU 0: [PPPP][DDD][PPP][DDDD]... (Dynamic partitioning)
+       ↑ 60% SMs   ↑ 40% SMs
+→ Same GPU handles both, but isolated
+
+SM Allocation Example:
+Total SMs: 132 (A100)
+- Prefill: 80 SMs (when compute-heavy)
+- Decode:  52 SMs (when latency-critical)
+- Dynamically adjusted every batch
+```
+
+#### Cơ Chế SM Partitioning
+
+```python
+class IntraGPUDisaggregation:
+    def __init__(self, total_sms=132):
+        self.total_sms = total_sms
+        self.prefill_sms = 0
+        self.decode_sms = 0
+
+    def partition_sms(self, workload_state):
+        """
+        Dynamic SM allocation based on workload
+
+        Cost Model:
+        - Prefill latency = f(num_sms, batch_size, seq_len)
+        - Decode latency = g(num_sms, num_seqs, kv_cache_size)
+
+        Optimize:
+        minimize: max(prefill_latency, decode_latency)
+        subject to: prefill_sms + decode_sms <= total_sms
+        """
+        # Analytical cost model (simplified)
+        prefill_tokens = workload_state.prefill_tokens
+        decode_seqs = workload_state.decode_seqs
+
+        # Compute saturation thresholds
+        prefill_sat = compute_saturation_point(prefill_tokens)
+        decode_sat = compute_saturation_point(decode_seqs)
+
+        # Allocate SMs proportionally, with hysteresis
+        if prefill_tokens > threshold:
+            self.prefill_sms = min(prefill_sat, self.total_sms * 0.7)
+        else:
+            self.prefill_sms = min(prefill_sat, self.total_sms * 0.3)
+
+        self.decode_sms = self.total_sms - self.prefill_sms
+
+        # Hysteresis: only change if delta > threshold
+        if abs(self.prefill_sms - self.prev_prefill_sms) < delta:
+            return  # No change to avoid thrashing
+
+        # Apply new partition
+        cuda.set_sm_partition(
+            prefill_stream, self.prefill_sms,
+            decode_stream, self.decode_sms
+        )
+```
+
+#### Benefits của Intra-GPU Disaggregation
+
+```
+Benchmark: Nexus vs vLLM (LLaMA-2 70B, single A100):
+
+Metric                    | vLLM Monolithic | Nexus Intra-GPU | Improvement
+--------------------------|-----------------|-----------------|-------------
+TTFT (median)             | 800ms           | 400ms           | 2x faster
+ITL (median)              | 25ms            | 20ms            | 1.25x faster
+ITL (P99)                 | 250ms           | 25ms            | 10x better!
+TBT (time-between-tokens) | 30ms            | 12ms            | 2.5x faster
+Throughput (tok/s)        | 1200            | 2640            | 2.2x higher
+
+Key Benefit: Consistent tail latency (P99 ≈ median)
+```
+
+### 8.7. So Sánh Các Approaches
+
+| Approach | Architecture | TTFT | ITL (P99) | Throughput | Cost | Complexity |
+|----------|--------------|------|-----------|------------|------|------------|
+| **Monolithic** | 1 instance, mixed workload | Medium | High (10x variance) | Medium | Low | Low |
+| **Chunked Prefill** | 1 instance, chunked scheduling | Medium | Medium (3x variance) | High | Low | Medium |
+| **Engine-level Disaggregation** | 2 instances, 2 GPUs | Low | Low (stable) | High | High (2x GPUs) | High |
+| **Intra-GPU Disaggregation** | 1 instance, dynamic SM partition | Low | Very Low | Very High | Low | Very High |
+
+### 8.8. Khi Nào Dùng Disaggregation?
+
+#### ✅ Nên dùng khi:
+
+1. **Tail Latency Critical:**
+   ```
+   Use Case: Chat applications, real-time assistants
+   Requirement: P99 ITL < 50ms
+   Solution: Disaggregated decode instance
+   ```
+
+2. **Mixed Workload:**
+   ```
+   Use Case: Platform serving both long prompts (RAG) and short prompts (chat)
+   Prefill: 1000-10,000 tokens (RAG documents)
+   Decode: 100-500 tokens (responses)
+   Solution: Separate prefill and decode instances
+   ```
+
+3. **Different Optimization Goals:**
+   ```
+   Prefill Goal: Maximize throughput (batch processing)
+   Decode Goal: Minimize latency (interactive)
+   Solution: Tune each instance independently
+   ```
+
+#### ❌ Không nên dùng khi:
+
+1. **Uniform Workload:**
+   ```
+   All requests: short prompts (~100 tokens) + short outputs (~50 tokens)
+   → Monolithic instance with continuous batching is sufficient
+   ```
+
+2. **Cost-Sensitive:**
+   ```
+   Engine-level disaggregation doubles GPU cost
+   → Use chunked prefill or intra-GPU disaggregation instead
+   ```
+
+3. **Single-Request Latency:**
+   ```
+   Only 1 request at a time
+   → No batching benefits, disaggregation adds overhead
+   ```
+
+### 8.9. Implementation Guide
+
+#### Setup: 2-Instance Disaggregation
+
+```python
+# === File: prefill_server.py ===
+from vllm import LLM, SamplingParams
+from vllm.distributed.kv_transfer.kv_connector import KVConnectorConfig
+
+def start_prefill_instance():
+    config = KVConnectorConfig(
+        kv_role="kv_producer",
+        kv_connector_type="SharedMemoryConnector",
+        kv_buffer_size=5e9,
+    )
+
+    llm = LLM(
+        model="meta-llama/Llama-2-13b-hf",
+        tensor_parallel_size=2,
+        max_num_batched_tokens=8192,
+        kv_connector_config=config,
+    )
+
+    # Prefill-only loop
+    while True:
+        request = receive_request()
+
+        # Only prefill (max_tokens=0)
+        output = llm.generate(
+            prompts=[request.prompt],
+            sampling_params=SamplingParams(max_tokens=0),
+        )
+
+        # KV cache automatically transferred via connector
+        print(f"Prefilled request {request.id}, KV cache sent to decode instance")
+
+# === File: decode_server.py ===
+def start_decode_instance():
+    config = KVConnectorConfig(
+        kv_role="kv_consumer",
+        kv_connector_type="SharedMemoryConnector",
+        kv_buffer_size=5e9,
+    )
+
+    llm = LLM(
+        model="meta-llama/Llama-2-13b-hf",
+        tensor_parallel_size=1,          # Less TP needed
+        max_num_seqs=128,
+        kv_connector_config=config,
+        enable_prefix_caching=True,
+    )
+
+    # Decode-only loop
+    while True:
+        # Receive KV cache from prefill instance (automatic via connector)
+        request = receive_kv_cache()
+
+        # Generate using prefilled KV cache
+        outputs = llm.generate(
+            prompts=[request.prompt],     # Metadata
+            sampling_params=SamplingParams(
+                max_tokens=request.max_tokens,
+                temperature=0.7,
+            ),
+        )
+
+        # Stream tokens back
+        for output in outputs:
+            stream_token(output.token)
+
+# Start both
+if __name__ == "__main__":
+    import multiprocessing
+    p1 = multiprocessing.Process(target=start_prefill_instance)
+    p2 = multiprocessing.Process(target=start_decode_instance)
+    p1.start()
+    p2.start()
+```
+
+### 8.10. Monitoring và Debugging
+
+#### Key Metrics
+
+```python
+from vllm import stats
+
+# Prefill Instance Metrics
+prefill_metrics = {
+    "avg_prefill_time_ms": stats.get_avg_prefill_time(),
+    "prefill_throughput_tokens_per_sec": stats.get_prefill_throughput(),
+    "kv_cache_transfer_bandwidth_gbps": stats.get_kv_transfer_bandwidth(),
+    "gpu_utilization": stats.get_gpu_utilization(),
+}
+
+# Decode Instance Metrics
+decode_metrics = {
+    "avg_itl_ms": stats.get_avg_inter_token_latency(),
+    "p99_itl_ms": stats.get_p99_inter_token_latency(),
+    "decode_throughput_tokens_per_sec": stats.get_decode_throughput(),
+    "num_running_seqs": stats.get_num_running_sequences(),
+}
+
+# Alert if P99 ITL too high
+if decode_metrics["p99_itl_ms"] > 50:
+    print("WARNING: High tail latency detected!")
+    # Scale decode instance or investigate bottleneck
+```
+
+### 8.11. Performance Results
+
+#### Production Results (Meta, 2025)
+
+```
+Meta's Internal vLLM Disaggregation Deployment:
+
+Workload: 1M requests/day, mixed prompt lengths (100-5000 tokens)
+
+Before (Monolithic):
+- TTFT P50: 600ms
+- TTFT P99: 3000ms
+- ITL P50:  25ms
+- ITL P99:  180ms
+- Throughput: 50K req/hour
+- Cost: 100 A100 GPUs
+
+After (Disaggregation):
+- TTFT P50: 300ms (2x better)
+- TTFT P99: 800ms (3.75x better)
+- ITL P50:  20ms (1.25x better)
+- ITL P99:  30ms (6x better!!!)
+- Throughput: 80K req/hour (1.6x)
+- Cost: 120 A100 GPUs (20% more, but worth it for latency)
+
+Key Win: Consistent user experience (P99 ≈ P50)
+```
+
+### 8.12. Trade-offs và Considerations
+
+#### Pros:
+
+✅ **Tail Latency:** P99 ITL dramatically reduced (6-10x)
+✅ **Tunable:** Independently optimize TTFT và ITL
+✅ **Flexible Parallelism:** Different TP/PP for prefill vs decode
+✅ **Better User Experience:** Consistent latency, no spikes
+
+#### Cons:
+
+❌ **Cost:** 2x GPUs for engine-level disaggregation
+❌ **Complexity:** More moving parts, harder to debug
+❌ **Transfer Overhead:** KV cache transfer adds 5-50ms latency
+❌ **No Throughput Gain:** Same throughput as monolithic (or worse if transfer slow)
+
+#### Recommendation:
+
+```python
+# Decision tree
+
+if tail_latency_critical:  # Chat, real-time apps
+    if budget_allows:
+        use_disaggregation = True
+        method = "engine_level"  # 2 instances, 2 GPU clusters
+    else:
+        use_disaggregation = True
+        method = "intra_gpu"     # Nexus-style (if available)
+else:
+    use_disaggregation = False
+    method = "chunked_prefill"   # Good enough for most cases
+```
+
+---
+
 ## Kết Luận và So Sánh
 
 ### Tổng Quan Các Tính Năng
@@ -3413,6 +4082,7 @@ Emerging techniques for long context:
 | **Prefix Caching** | Redundant computation | TTFT 3-5x nhanh hơn cho requests có chung prefix | Memory overhead nhỏ |
 | **Quantization** | High memory usage, expensive hardware | Memory 2-4x reduction, cost 50-75% lower | Accuracy degradation 2-8% |
 | **Context Parallelism** | Long context (100K-1M tokens), KV cache bottleneck | Memory 3x reduction, latency 2-3x faster cho long context | Communication overhead, chỉ hiệu quả với long context |
+| **Disaggregated Prefill/Decode** | Phase interference, tail ITL spikes | P99 ITL 6-10x better, consistent latency | 2x GPU cost (engine-level), transfer overhead, complexity |
 
 ### Khi Nào Dùng vLLM?
 
@@ -3572,6 +4242,12 @@ vLLM đang phát triển các tính năng:
 
 11. **Megatron-LM**: NVIDIA's framework for distributed training (inspiration for TP/PP)
 12. **FasterTransformer**: NVIDIA's optimized inference library
+
+### Disaggregated Inference
+
+13. **Disaggregated Prefill vLLM Docs**: https://docs.vllm.ai/en/latest/features/disagg_prefill.html
+14. **PyTorch Blog - Disaggregated Inference**: https://pytorch.org/blog/disaggregated-inference-at-scale-with-pytorch-vllm/
+15. **Nexus Paper**: "Proactive Intra-GPU Disaggregation of Prefill and Decode in LLM Serving" (arXiv 2507.06608, 2025)
 
 ---
 

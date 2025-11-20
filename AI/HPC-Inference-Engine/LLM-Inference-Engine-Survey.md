@@ -119,18 +119,410 @@ AIBrix giới thiệu **Distributed KV Cache Runtime**, một hệ thống mở 
 
 ### 1.6. Kiến trúc
 
-**Core Components**:
-1. **StormService**: Service orchestration layer
-2. **Router**: Traffic routing với multiple strategies
-3. **KVCache Offloading Framework**: Quản lý cache lifecycle
-4. **Autoscaler**: LLM-tailored autoscaling logic
-5. **AI Engine Runtime**: Riêng biệt cho inference execution
+#### a. Tổng quan Kiến trúc
+
+AIBrix sử dụng **layered microservices architecture** với phân tách rõ ràng giữa các layers:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              Gateway Layer (Envoy-based)                 │
+│  - ExtProc gRPC interface                               │
+│  - RouterManager (7 routing algorithms)                 │
+│  - RateLimiter (Redis-backed)                           │
+└─────────────────────────────────────────────────────────┘
+                          │
+┌─────────────────────────────────────────────────────────┐
+│              Control Plane (K8s Controllers)             │
+│  - PodAutoscalerReconciler (HPA/KPA/APA)                │
+│  - ModelAdapterReconciler (LoRA lifecycle)              │
+│  - ModelRouterReconciler (HTTPRoute creation)           │
+│  - StormServiceReconciler (Multi-node orchestration)    │
+│  - KVCacheReconciler (Distributed cache deployment)     │
+└─────────────────────────────────────────────────────────┘
+                          │
+┌─────────────────────────────────────────────────────────┐
+│              Data Plane (Inference Engines)              │
+│  - vLLM / SGLang / xLLM workers                         │
+│  - aibrix-runtime sidecar (metrics standardization)     │
+│  - ZMQ publishers (KV cache synchronization)            │
+└─────────────────────────────────────────────────────────┘
+                          │
+┌─────────────────────────────────────────────────────────┐
+│              Shared Services Layer                       │
+│  - Redis (state coordination)                           │
+│  - aibrix-metadata-service (FastAPI discovery)          │
+│  - Prometheus (metrics collection)                      │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### b. Core Components Chi Tiết
+
+**1. Gateway Layer Components**:
+- **gateway.Server**: Implements Envoy ExtProc protocol để intercept requests
+- **RouterManager**: Plugin-style architecture với 7 routing algorithms
+- **RateLimiter**: Redis-backed enforcement của RPM/TPM limits
+- **Routing Algorithms**: random, least-request, throughput, prefix-cache, least-busy-time, least-kv-cache, least-latency, prefix-cache-preble
+
+**2. Control Plane Reconcilers**:
+- **PodAutoscalerReconciler**:
+  - Dual-window metrics collection (180s stable, 60s panic)
+  - Queries Prometheus every 30s (configurable)
+  - Supports HPA/KPA/APA autoscaling strategies
+
+- **ModelAdapterReconciler**:
+  - LoRA adapter lifecycle management
+  - Retry/failover mechanisms
+  - Dynamic adapter loading via runtime sidecar
+
+- **ModelRouterReconciler**:
+  - Dynamic HTTPRoute creation based on Deployment labels
+  - Gateway API integration
+
+- **StormServiceReconciler**:
+  - Multi-node inference orchestration
+  - RoleSet management cho distributed deployments
+  - KubeRay operator integration (optional)
+
+- **KVCacheReconciler**:
+  - Distributed cache server deployment
+  - Consistent hashing cho cache distribution
+  - L1/L2 cache tier management
+
+**3. Data Plane Runtime**:
+- **aibrix-runtime sidecar**:
+  - Metrics standardization across engines
+  - Artifact delegation (model download)
+  - LoRA adapter loading coordination
+  - Communicates với inference engines via local socket/HTTP
+
+- **aibrix-metadata-service**:
+  - FastAPI-based discovery service
+  - Model và adapter metadata registry
+  - Service endpoint discovery
+
+**4. Shared Services**:
+- **Redis**:
+  - Rate limit counters (50ms refresh intervals)
+  - Metrics cache
+  - Prefix cache indices
+  - Distributed state coordination
+
+- **Prometheus**:
+  - Metrics collection từ controllers, gateway, sidecars
+  - Autoscaler queries cho historical metrics
+  - Custom metrics: request counts, latency, KV cache utilization, GPU metrics
+
+#### c. Codebase Structure
+
+```
+aibrix/
+├── cmd/
+│   ├── main.go                          # Controller-manager entry point
+│   └── gateway-plugins/main.go          # Gateway plugins binary
+│
+├── pkg/
+│   ├── controller/                      # Reconciliation logic
+│   │   ├── podautoscaler/              # Autoscaling controller
+│   │   ├── modeladapter/               # LoRA adapter controller
+│   │   ├── modelrouter/                # Routing controller
+│   │   ├── stormservice/               # Multi-node orchestration
+│   │   └── kvcache/                    # Cache controller
+│   │
+│   ├── plugins/gateway/                 # Routing algorithms
+│   │   ├── random.go
+│   │   ├── least_request.go
+│   │   ├── throughput.go
+│   │   ├── prefix_cache.go
+│   │   └── least_latency.go
+│   │
+│   ├── metrics/                         # Prometheus integration
+│   ├── cache/                           # Redis caching logic
+│   └── autoscaler/                      # Scaling algorithms
+│
+├── python/
+│   ├── aibrix_runtime/                  # Sidecar process
+│   │   ├── metrics_collector.py
+│   │   ├── artifact_downloader.py
+│   │   └── adapter_loader.py
+│   │
+│   ├── aibrix_metadata_service/         # Discovery API
+│   │   └── main.py                      # FastAPI application
+│   │
+│   └── aibrix_kvcache/                  # L1/L2 cache framework
+│       ├── backends/                     # Redis, InfiniStore, HPKV
+│       └── eviction_policies/           # LRU, FIFO, S3FIFO
+│
+├── config/
+│   ├── overlays/                        # Environment-specific configs
+│   │   ├── release/
+│   │   ├── development/
+│   │   └── vke/                         # Volcano Engine Container Registry
+│   │
+│   └── standalone/                      # Individual controller deployment
+│       ├── podautoscaler/
+│       ├── modeladapter/
+│       └── stormservice/
+│
+└── deploy/
+    ├── helm/                            # Helm charts
+    └── manifests/                       # Raw Kubernetes manifests
+```
+
+#### d. API Design Patterns
+
+**Custom Resource Definitions (CRDs)**:
+
+1. **PodAutoscaler**:
+```yaml
+apiVersion: aibrix.io/v1alpha1
+kind: PodAutoscaler
+spec:
+  scaleTargetRef:
+    name: model-deployment
+  metrics:
+    - type: Throughput
+      target:
+        averageValue: "1000"
+  behavior:
+    stableWindow: 180s
+    panicWindow: 60s
+```
+
+2. **ModelAdapter**:
+```yaml
+apiVersion: aibrix.io/v1alpha1
+kind: ModelAdapter
+spec:
+  baseModel: meta-llama/Llama-2-7b
+  adapterSource: s3://bucket/lora-adapter
+  scaling:
+    minReplicas: 1
+    maxReplicas: 10
+```
+
+3. **StormService**:
+```yaml
+apiVersion: aibrix.io/v1alpha1
+kind: StormService
+spec:
+  modelName: meta-llama/Llama-2-70b
+  parallelism:
+    tensorParallel: 4
+    pipelineParallel: 2
+  roleSet:
+    head:
+      replicas: 1
+    workers:
+      replicas: 7
+```
+
+4. **KVCache**:
+```yaml
+apiVersion: aibrix.io/v1alpha1
+kind: KVCache
+spec:
+  l1Cache:
+    backend: redis
+    evictionPolicy: S3FIFO
+  l2Cache:
+    backend: infinitstore
+    capacity: "100Gi"
+```
+
+#### e. Configuration Management Layers
+
+**1. Environment Variables**:
+```bash
+AIBRIX_REDIS_ENDPOINT=redis://redis:6379
+AIBRIX_CACHE_BACKEND=redis  # redis | infinitstore | hpkv
+AIBRIX_TOKENIZER_POOL_SIZE=10
+AIBRIX_EVICTION_POLICY=S3FIFO  # LRU | FIFO | S3FIFO
+```
+
+**2. Kustomize Overlays**:
+- **release**: Production deployment với all components
+- **development**: Local development với reduced resource limits
+- **vke**: Volcano Engine-specific configurations
+
+**3. Helm Charts**:
+```yaml
+# values.yaml
+controllers:
+  enabled:
+    - podautoscaler
+    - modeladapter
+    - stormservice
+    - kvcache
+
+gateway:
+  defaultRoutingStrategy: prefix-cache
+  rateLimiting:
+    enabled: true
+    rpm: 1000
+    tpm: 50000
+
+redis:
+  endpoint: redis://redis:6379
+  refreshInterval: 50ms
+```
+
+**4. CRD Annotations**:
+```yaml
+annotations:
+  aibrix.io/metrics-window: "180s"
+  aibrix.io/adapter-retry-count: "3"
+  aibrix.io/cache-ttl: "3600s"
+```
+
+#### f. Extension Points
+
+**1. Router Plugin Architecture**:
+```go
+// Router interface
+type Router interface {
+    SelectPod(ctx context.Context, pods []Pod, request Request) (*Pod, error)
+}
+
+// Auto-registration pattern
+func init() {
+    routing.Register("custom-algorithm", NewCustomRouter)
+}
+
+type CustomRouter struct {
+    // Implementation
+}
+
+func (r *CustomRouter) SelectPod(ctx context.Context, pods []Pod, request Request) (*Pod, error) {
+    // Custom routing logic
+    return selectedPod, nil
+}
+```
+
+**2. Cache Backend Extension**:
+```python
+from aibrix_kvcache.backends import CacheBackend
+
+class CustomCacheBackend(CacheBackend):
+    def get(self, key: str) -> Optional[bytes]:
+        # Custom retrieval logic
+        pass
+
+    def put(self, key: str, value: bytes) -> None:
+        # Custom storage logic
+        pass
+```
+
+**3. Webhook Customization**:
+- **Validating Webhooks**: Validate CRD specifications
+- **Mutating Webhooks**: Inject runtime sidecars, set defaults
+- Extensible via Kubernetes webhook configuration
+
+#### g. Deployment Patterns
+
+**1. Full Stack Deployment**:
+```bash
+kubectl apply -f https://github.com/vllm-project/aibrix/releases/download/v0.3.0/aibrix-core-v0.3.0.yaml
+```
+
+Deploys:
+- controller-manager
+- gateway-plugins
+- metadata-service
+- kvcache-watcher
+- Required CRDs
+
+**2. Standalone Controllers**:
+```bash
+# Deploy only autoscaler
+kubectl apply -f config/standalone/podautoscaler/
+
+# Deploy only LoRA adapter management
+kubectl apply -f config/standalone/modeladapter/
+```
+
+**3. Helm-Based Deployment**:
+```bash
+helm install aibrix ./deploy/helm/aibrix \
+  --set controllers.enabled="{podautoscaler,modeladapter,stormservice}" \
+  --set gateway.defaultRoutingStrategy=prefix-cache \
+  --set redis.endpoint=redis://redis:6379
+```
+
+#### h. Integration Patterns
+
+**1. vLLM Integration**:
+```python
+# Runtime sidecar discovers vLLM port
+vllm_port = os.getenv("VLLM_PORT", "8000")
+vllm_client = HTTPClient(f"http://localhost:{vllm_port}")
+
+# Download artifacts before vLLM startup
+await artifact_downloader.download(model_uri)
+
+# Load LoRA adapters dynamically
+await adapter_loader.load(adapter_path)
+
+# Transform metrics to standardized schema
+metrics = await vllm_client.get_metrics()
+standardized_metrics = transform_metrics(metrics)
+```
+
+**2. Ray Integration** (for StormService):
+```yaml
+# StormService triggers RayClusterFleet creation
+apiVersion: ray.io/v1alpha1
+kind: RayCluster
+spec:
+  headGroupSpec:
+    rayStartParams:
+      node-ip-address: $MY_POD_IP
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 7
+```
+
+**3. Redis Coordination**:
+```python
+# Rate limit enforcement
+redis_client = redis.Redis(host="redis", port=6379)
+
+# Increment request counter
+current_count = redis_client.incr(f"ratelimit:{user_id}:rpm")
+if current_count > rpm_limit:
+    raise RateLimitExceeded()
+
+# Cache prefix indices for routing
+redis_client.hset(f"prefix_cache:{model_id}", prefix_hash, pod_id)
+```
+
+**4. Prometheus Metrics**:
+```go
+// Controllers emit metrics
+autoscalerMetrics.ReconcileCount.Inc()
+autoscalerMetrics.ScalingDecisions.WithLabelValues("scale-up").Observe(float64(newReplicas))
+
+// Gateway emits request metrics
+requestDuration.Observe(duration.Seconds())
+routingDecisions.WithLabelValues(algorithm, podID).Inc()
+
+// Autoscaler queries Prometheus
+query := fmt.Sprintf("rate(requests_total{deployment=%s}[60s])", deploymentName)
+result, err := prometheusClient.Query(ctx, query, time.Now())
+```
 
 **Tech Stack**:
-- Kubernetes-native
-- Extends Envoy Gateway
-- Integrates với vLLM engine
-- Support cho multiple cloud providers
+- **Languages**: Go (control plane), Python (data plane, sidecars)
+- **Orchestration**: Kubernetes-native (CRDs, controllers, webhooks)
+- **Gateway**: Envoy Gateway (ExtProc protocol)
+- **Inference Engines**: vLLM, SGLang, xLLM
+- **Messaging**: ZeroMQ (KV cache synchronization)
+- **State Store**: Redis (distributed coordination)
+- **Metrics**: Prometheus + custom exporters
+- **Optional**: KubeRay (multi-node Ray clusters)
+
+**Nguồn**:
+- GitHub: https://github.com/vllm-project/aibrix
+- DeepWiki: https://deepwiki.com/vllm-project/aibrix
 
 ---
 
@@ -249,27 +641,684 @@ Theo MLCommons (https://mlcommons.org/2025/04/llm-inference-v5/):
 
 ### 2.6. Kiến trúc
 
-#### Control Plane Components
-1. **InferenceService CRD**: Định nghĩa model deployment
-2. **InferenceGraph CRD**: Multi-step inference workflows
-3. **ServingRuntime**: Runtime templates cho specific frameworks
-4. **ClusterServingRuntime**: Cluster-wide runtime definitions
-5. **LocalModelCache CRD**: Model caching configuration
+#### a. Tổng quan Kiến trúc
 
-#### Data Plane Components
-1. **Predictor**: Model serving component
-2. **Transformer**: Pre/post-processing (optional)
-3. **Explainer**: Model explanation (optional)
+KServe triển khai **Kubernetes operator pattern** với CRDs để abstract ML model serving complexity:
 
-#### Tech Stack
-- **Kubernetes-native**: Leverages K8s primitives
-- **Knative Serving**: Serverless capabilities
-- **Istio/Service Mesh**: Advanced traffic management
-- **OpenShift Serverless**: Enterprise integration (Red Hat)
-- **Prometheus/Grafana**: Observability
+```
+┌──────────────────────────────────────────────────────┐
+│              Control Plane Layer                      │
+│  ┌─────────────────────────────────────────────┐    │
+│  │  InferenceServiceReconciler                 │    │
+│  │  ├── PredictorReconciler                    │    │
+│  │  ├── TransformerReconciler                  │    │
+│  │  └── ExplainerReconciler                    │    │
+│  └─────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────┐    │
+│  │  ServingRuntime Controllers                 │    │
+│  │  LLMInferenceService Reconciler             │    │
+│  └─────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────┘
+                        │
+┌──────────────────────────────────────────────────────┐
+│              Infrastructure Layer                     │
+│  ┌────────────┐  ┌────────────┐  ┌──────────────┐  │
+│  │  Knative   │  │   Istio    │  │ Gateway API  │  │
+│  │  Serving   │  │  Service   │  │   (v1.2.1)   │  │
+│  │  (v1.15)   │  │  Mesh      │  │              │  │
+│  └────────────┘  └────────────┘  └──────────────┘  │
+└──────────────────────────────────────────────────────┘
+                        │
+┌──────────────────────────────────────────────────────┐
+│              Data Plane Layer                         │
+│  ┌─────────────────────────────────────────────┐    │
+│  │  Python Model Server Framework              │    │
+│  │  ├── ModelServer (base class)               │    │
+│  │  ├── Protocol Handlers (REST/gRPC/OpenAI)   │    │
+│  │  ├── Storage Abstraction (S3/GCS/Azure)     │    │
+│  │  └── Model Implementations                  │    │
+│  │      ├── SKLearn, PyTorch, TensorFlow       │    │
+│  │      ├── Hugging Face Transformers          │    │
+│  │      └── Custom Models                      │    │
+│  └─────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────┘
+```
+
+**Deployment Modes**:
+
+1. **Serverless Mode (Default)**:
+```
+Client → Istio Gateway → Knative Service
+       → Knative Activator (scale-from-zero)
+       → Knative Autoscaler → Inference Pod
+```
+
+2. **Raw Deployment Mode**:
+```
+Client → Kubernetes Service → Kubernetes Deployment
+       → Inference Pod → Optional HPA/KEDA Scaler
+```
+
+#### b. Control Plane Components Chi Tiết
+
+**1. Core CRDs và Resource Model**:
+
+**InferenceService (v1beta1 - Stable)**:
+```yaml
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: sklearn-iris
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: sklearn
+        version: "1.0"
+      storageUri: s3://models/sklearn/iris
+      runtime: sklearn-server
+      resources:
+        limits:
+          cpu: "1"
+          memory: "2Gi"
+        requests:
+          cpu: "500m"
+          memory: "1Gi"
+  transformer:  # Optional pre/post-processing
+    containers:
+      - name: transformer
+        image: custom-transformer:latest
+  explainer:  # Optional model explanation
+    containers:
+      - name: explainer
+        image: alibi-explainer:latest
+```
+
+**ServingRuntime/ClusterServingRuntime (v1alpha1)**:
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: sklearn-runtime
+  namespace: production
+spec:
+  supportedModelFormats:
+    - name: sklearn
+      version: "1"
+      autoSelect: true
+      priority: 10
+  protocolVersions:
+    - v1
+    - v2
+  multiModel: false
+  containers:
+    - name: kserve-container
+      image: kserve/sklearnserver:latest
+      ports:
+        - containerPort: 8080
+          name: h2c
+          protocol: TCP
+      env:
+        - name: STORAGE_URI
+          value: "{{.StorageUri}}"
+  builtInAdapter:
+    serverType: mlserver
+    runtimeManagementPort: 8001
+```
+
+**Runtime Selection Algorithm**:
+1. Namespace-scoped ServingRuntime > ClusterServingRuntime (precedence)
+2. Model format and version compatibility validation
+3. Protocol version matching (v1, v2, gRPC, OpenAI)
+4. Priority-based ordering cho multiple matches
+
+**InferenceGraph (v1alpha1)** - Multi-Model Workflows:
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: InferenceGraph
+metadata:
+  name: sentiment-analysis-pipeline
+spec:
+  nodes:
+    preprocess:
+      routerType: Sequence
+      steps:
+        - serviceName: text-normalizer
+        - serviceName: tokenizer
+
+    model-ensemble:
+      routerType: Ensemble
+      steps:
+        - serviceName: bert-base
+          weight: 30
+        - serviceName: roberta-large
+          weight: 70
+
+    ab-test:
+      routerType: Splitter
+      steps:
+        - serviceName: model-v1
+          weight: 90
+        - serviceName: model-v2-canary
+          weight: 10
+
+    conditional:
+      routerType: Switch
+      steps:
+        - serviceName: light-model
+          condition: "{{.input.size < 100}}"
+        - serviceName: heavy-model
+          condition: "{{.input.size >= 100}}"
+```
+
+**Four Routing Patterns**:
+- **Sequence**: Chain models với response passing
+- **Splitter**: A/B testing và canary deployments (percentage-based)
+- **Ensemble**: Parallel execution với weighted aggregation
+- **Switch**: Conditional routing using CEL (Common Expression Language)
+
+**LLMInferenceService (v1alpha1)** - LLM-Specific:
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: LLMInferenceService
+metadata:
+  name: llama2-70b
+spec:
+  # Single-node deployment
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: kserve-container
+          image: vllm/vllm-openai:latest
+          args:
+            - --model=meta-llama/Llama-2-70b-hf
+            - --tensor-parallel-size=4
+          resources:
+            limits:
+              nvidia.com/gpu: "4"
+
+  # Multi-node with parallelism
+  parallelism:
+    tensorParallel: 4
+    pipelineParallel: 2
+
+  # Disaggregated prefill/decode
+  prefill:
+    replicas: 2
+    template:
+      spec:
+        containers:
+          - name: prefill-worker
+            args:
+              - --disable-frontend-multiprocessing
+
+  # LoRA adapters
+  adapters:
+    - name: customer-support-adapter
+      storageUri: s3://lora-adapters/customer-support
+```
+
+**2. Reconciliation Controllers**:
+
+```go
+// pkg/controller/v1beta1/inferenceservice/reconcilers/
+type InferenceServiceReconciler struct {
+    predictorReconciler  *PredictorReconciler
+    transformerReconciler *TransformerReconciler
+    explainerReconciler  *ExplainerReconciler
+}
+
+func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    // 1. Fetch InferenceService resource
+    isvc := &v1beta1.InferenceService{}
+    if err := r.Get(ctx, req.NamespacedName, isvc); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    // 2. Reconcile predictor (required)
+    if err := r.predictorReconciler.Reconcile(ctx, isvc); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 3. Reconcile transformer (optional)
+    if isvc.Spec.Transformer != nil {
+        if err := r.transformerReconciler.Reconcile(ctx, isvc); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+
+    // 4. Reconcile explainer (optional)
+    if isvc.Spec.Explainer != nil {
+        if err := r.explainerReconciler.Reconcile(ctx, isvc); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+
+    // 5. Update status conditions
+    return r.updateStatus(ctx, isvc)
+}
+```
+
+**Strategic Merge Patch Logic**:
+- Well-known default configurations (lowest priority)
+- User-specified baseRefs (ordered application)
+- InferenceService spec (highest priority)
+- Container merging by name
+- Template variable substitution
+
+#### c. Data Plane Framework
+
+**Python Model Server Architecture**:
+
+```
+kserve/
+├── kserve/
+│   ├── model.py                    # Base Model class
+│   ├── model_server.py             # ModelServer lifecycle
+│   ├── protocol/
+│   │   ├── rest/
+│   │   │   ├── v1_endpoints.py     # V1 protocol handlers
+│   │   │   └── v2_endpoints.py     # V2 protocol handlers
+│   │   ├── grpc/
+│   │   │   ├── grpc_predict_v2.py
+│   │   │   └── servicer.py
+│   │   └── openai/
+│   │       ├── chat_completions.py
+│   │       └── completions.py
+│   ├── storage/
+│   │   ├── storage.py              # Abstraction layer
+│   │   ├── s3.py                   # S3 implementation
+│   │   ├── gcs.py                  # Google Cloud Storage
+│   │   ├── azure_blob.py           # Azure Blob Storage
+│   │   └── pvc.py                  # PersistentVolumeClaim
+│   └── logging/
+│       └── logger.py
+│
+├── sklearnserver/
+│   └── __main__.py                 # SKLearn model server
+├── xgbserver/
+│   └── __main__.py                 # XGBoost model server
+├── torchserver/
+│   └── __main__.py                 # PyTorch model server
+├── huggingfaceserver/
+│   └── __main__.py                 # Hugging Face Transformers
+└── custom_model/                   # Custom model template
+    └── model.py
+```
+
+**Base Model Class**:
+```python
+from kserve import Model
+
+class CustomModel(Model):
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.model = None
+
+    def load(self) -> bool:
+        """Load model artifacts from storage"""
+        # Download from storageUri
+        model_path = self.download_model()
+        # Initialize model
+        self.model = load_model_framework(model_path)
+        self.ready = True
+        return True
+
+    def predict(self, request: Dict, headers: Dict = None) -> Dict:
+        """Run inference"""
+        inputs = self.preprocess(request["instances"])
+        outputs = self.model.predict(inputs)
+        return {"predictions": self.postprocess(outputs)}
+
+    def explain(self, request: Dict, headers: Dict = None) -> Dict:
+        """Optional: Generate explanations"""
+        pass
+```
+
+**Protocol Handlers**:
+
+1. **V1 Protocol** (Traditional ML):
+```python
+# POST /v1/models/{model_name}:predict
+{
+  "instances": [
+    [1.0, 2.0, 3.0],
+    [4.0, 5.0, 6.0]
+  ]
+}
+# Response
+{
+  "predictions": [0, 1]
+}
+```
+
+2. **V2 Protocol** (Advanced features):
+```python
+# POST /v2/models/{model_name}/infer
+{
+  "inputs": [
+    {
+      "name": "input-0",
+      "shape": [2, 3],
+      "datatype": "FP32",
+      "data": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    }
+  ]
+}
+```
+
+3. **OpenAI-Compatible** (LLMs):
+```python
+# POST /openai/v1/chat/completions
+{
+  "model": "llama2-7b",
+  "messages": [
+    {"role": "user", "content": "Explain neural networks"}
+  ],
+  "max_tokens": 100,
+  "temperature": 0.7
+}
+```
+
+**Storage Abstraction**:
+```python
+from kserve.storage import Storage
+
+# Supports multiple backends
+storage_uri = "s3://bucket/model"  # or gs://, azurefs://, hf://, pvc://
+model_path = Storage.download(storage_uri)
+
+# Backend-specific implementations
+class S3Storage(Storage):
+    def download(self, uri: str) -> str:
+        # boto3 implementation
+        pass
+
+class GCSStorage(Storage):
+    def download(self, uri: str) -> str:
+        # google-cloud-storage implementation
+        pass
+```
+
+#### d. Codebase Structure (Go Control Plane)
+
+```
+kserve/
+├── pkg/
+│   ├── apis/serving/
+│   │   ├── v1beta1/
+│   │   │   ├── inference_service.go       # InferenceService CRD
+│   │   │   ├── predictor.go
+│   │   │   ├── transformer.go
+│   │   │   └── explainer.go
+│   │   └── v1alpha1/
+│   │       ├── serving_runtime.go         # ServingRuntime CRD
+│   │       ├── inference_graph.go         # InferenceGraph CRD
+│   │       ├── llm_inference_service.go   # LLMInferenceService CRD
+│   │       └── local_model_cache.go       # LocalModelCache CRD
+│   │
+│   ├── controller/
+│   │   ├── v1beta1/
+│   │   │   └── inferenceservice/
+│   │   │       ├── components/
+│   │   │       │   ├── predictor.go
+│   │   │       │   ├── transformer.go
+│   │   │       │   └── explainer.go
+│   │   │       ├── reconcilers/
+│   │   │       │   ├── knative/           # Serverless mode
+│   │   │       │   │   └── service_reconciler.go
+│   │   │       │   └── raw/               # Raw deployment mode
+│   │   │       │       └── deployment_reconciler.go
+│   │   │       └── controller.go
+│   │   └── v1alpha1/
+│   │       ├── servingruntime/
+│   │       │   └── controller.go
+│   │       ├── inferencegraph/
+│   │       │   └── controller.go
+│   │       └── llmisvc/
+│   │           └── controller.go          # LLM-specific reconciliation
+│   │
+│   ├── webhook/
+│   │   ├── admission/
+│   │   │   ├── validator.go               # Validation webhooks
+│   │   │   └── mutator.go                 # Mutation webhooks
+│   │   └── pod/
+│   │       └── storage_initializer_injector.go
+│   │
+│   └── utils/
+│       ├── merge.go                       # Strategic merge patch
+│       └── selector.go                    # Runtime selection logic
+│
+└── config/
+    ├── crd/                               # CRD definitions
+    ├── rbac/                              # RBAC manifests
+    ├── webhook/                           # Webhook configurations
+    └── manager/                           # Controller manager deployment
+```
+
+#### e. Configuration Management
+
+**1. ConfigMap-Driven Configuration**:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inferenceservice-config
+  namespace: kserve
+data:
+  predictors: |
+    {
+      "sklearn": {
+        "image": "kserve/sklearnserver",
+        "defaultImageVersion": "latest",
+        "supportedFrameworks": ["sklearn"],
+        "multiModelServer": false
+      },
+      "tensorflow": {
+        "image": "tensorflow/serving",
+        "defaultImageVersion": "2.14.0",
+        "supportedFrameworks": ["tensorflow"]
+      }
+    }
+
+  ingress: |
+    {
+      "ingressGateway": "knative-serving/knative-ingress-gateway",
+      "ingressService": "istio-ingressgateway.istio-system.svc.cluster.local"
+    }
+
+  logger: |
+    {
+      "image": "kserve/agent:latest",
+      "memoryRequest": "100Mi",
+      "memoryLimit": "1Gi"
+    }
+```
+
+**2. LLMInferenceServiceConfig Templates**:
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: LLMInferenceServiceConfig
+metadata:
+  name: vllm-template
+  namespace: kserve
+spec:
+  template:
+    spec:
+      containers:
+        - name: kserve-container
+          image: vllm/vllm-openai:v0.6.0
+          args:
+            - --model={{.ModelName}}
+            - --tensor-parallel-size={{.TensorParallelSize}}
+            - --enable-prefix-caching
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          resources:
+            limits:
+              nvidia.com/gpu: "{{.GPUCount}}"
+```
+
+**Well-known configs auto-applied**:
+- `kserve-config-llm-template`: Single-node deployment defaults
+- `kserve-config-llm-worker-data-parallel`: Multi-node data parallel config
+- `kserve-config-llm-scheduler`: When Inference Gateway scheduler enabled
+
+**3. Helm Installation**:
+```bash
+# Install CRDs
+helm install kserve-crd oci://ghcr.io/kserve/charts/kserve-crd \
+  --version v0.15.2 \
+  --namespace kserve \
+  --create-namespace
+
+# Install KServe resources
+helm install kserve oci://ghcr.io/kserve/charts/kserve \
+  --version v0.15.2 \
+  --namespace kserve \
+  --set kserve.modelmesh.enabled=false \
+  --set kserve.controller.image=kserve/kserve-controller:v0.15.0
+```
+
+#### f. Integration Patterns
+
+**1. Knative Serving Integration** (Serverless Mode):
+```yaml
+# InferenceService creates KnativeService
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: sklearn-iris-predictor
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/class: kpa
+        autoscaling.knative.dev/target: "70"
+        autoscaling.knative.dev/metric: concurrency
+    spec:
+      containers:
+        - name: kserve-container
+          image: kserve/sklearnserver:latest
+          env:
+            - name: STORAGE_URI
+              value: s3://models/sklearn/iris
+      containerConcurrency: 10
+      timeoutSeconds: 300
+```
+
+**Features**:
+- **Scale-to-zero**: Automatic pod termination after idle period
+- **Request-based autoscaling**: KPA (Knative Pod Autoscaler)
+- **Revision tracking**: Automatic rollback capability
+- **Traffic splitting**: Canary deployments via percentage routing
+
+**2. Istio Service Mesh Integration**:
+```yaml
+# VirtualService for traffic management
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: sklearn-iris
+spec:
+  hosts:
+    - sklearn-iris.example.com
+  gateways:
+    - knative-serving/knative-ingress-gateway
+  http:
+    - match:
+        - uri:
+            prefix: /v1/models/sklearn-iris
+      route:
+        - destination:
+            host: sklearn-iris-predictor.default.svc.cluster.local
+          weight: 90
+        - destination:
+            host: sklearn-iris-v2-predictor.default.svc.cluster.local
+          weight: 10  # Canary 10%
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+      timeout: 10s
+```
+
+**3. Inference Gateway Integration** (Advanced LLM Routing):
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: llama2-route
+spec:
+  parentRefs:
+    - name: kserve-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /openai/v1/chat/completions
+      backendRefs:
+        - name: llama2-pool
+          kind: InferencePool
+          group: inference.networking.k8s.io
+
+---
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: llama2-pool
+spec:
+  endpoints:
+    - name: llama2-prefill
+      namespace: production
+    - name: llama2-decode
+      namespace: production
+  endpointPicker:
+    config:
+      scorers:
+        - name: prefix-cache-scorer
+        - name: queue-depth-scorer
+```
+
+#### g. Best Practices và Design Principles
+
+**1. Resource Design Principles**:
+- **Declarative specification**: Define desired state, not procedures
+- **Separation of concerns**: Predictor, Transformer, Explainer as distinct components
+- **Composability**: Templates và inheritance cho config reuse
+- **Progressive disclosure**: Simple defaults with advanced options available
+
+**2. Operational Patterns**:
+- **Namespace isolation**: ServingRuntime scoping cho multi-tenant scenarios
+- **Version control**: API versions (v1beta1, v1alpha1) cho stability
+- **Health checking**: Built-in readiness and liveness probes
+- **Observability**: Metrics, tracing, logging integration points
+
+**3. Performance Considerations**:
+- **Model server pooling**: Connection reuse across requests
+- **Batching support**: Native request batching via Batcher component
+- **Protocol efficiency**: gRPC cho low-latency scenarios
+- **Resource optimization**: Automatic horizontal scaling based on load
+
+**Tech Stack Summary**:
+- **Languages**: Go (control plane), Python (data plane)
+- **Orchestration**: Kubernetes CRDs, Controllers, Webhooks
+- **Serverless**: Knative Serving (optional, v1.15.2)
+- **Service Mesh**: Istio (optional, v1.23.2)
+- **Gateway**: Gateway API (v1.2.1), Inference Gateway (LLM-specific)
+- **Autoscaling**: KPA (Knative), HPA (Kubernetes), KEDA (optional)
+- **Certificate Management**: cert-manager (v1.16.1)
+- **Protocols**: REST (v1/v2), gRPC, OpenAI-compatible
+- **Storage**: S3, GCS, Azure Blob, PVC, Hugging Face Hub
 
 **Nguồn**:
-- KServe Architecture Docs
+- KServe GitHub: https://github.com/kserve/kserve
+- KServe Documentation: https://kserve.github.io/website
+- DeepWiki: https://deepwiki.com/kserve/kserve
 - Kubernetes-Based LLM Inference Overview: https://rudeigerc.dev/posts/kubernetes-based-llm-inference-architectures-an-overview/
 
 ---
