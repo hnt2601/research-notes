@@ -954,9 +954,410 @@ Việc tính toán chính xác VRAM cho LLM inference giúp:
 
 **Lưu ý:** Luôn để dư 10-20% VRAM để xử lý spike và overhead không lường trước được.
 
+## Tối ưu hóa cho vLLM Production với Batch Size Lớn
+
+### Đặc điểm quan trọng của vLLM
+
+vLLM tối ưu hóa inference thông qua:
+1. **PagedAttention**: Quản lý KV cache hiệu quả, giảm fragmentation
+2. **Continuous Batching**: Dynamic batching để tối ưu throughput
+3. **GQA (Grouped Query Attention)**: Giảm KV cache size đáng kể
+
+### Công thức KV Cache cho vLLM với GQA
+
+**Công thức chính xác:**
+
+```
+KV Cache = 2 × num_layers × batch_size × sequence_length × (num_key_value_heads × head_dim) × 2 bytes
+
+Trong đó:
+- num_key_value_heads: Số KV heads (nhỏ hơn num_attention_heads trong GQA)
+- head_dim = hidden_size / num_attention_heads
+- 2 bytes = FP16 precision cho KV cache (standard trong vLLM)
+```
+
+**Lưu ý:** GQA giảm KV cache bằng cách share keys/values giữa nhiều attention heads. Ví dụ:
+- Llama-3.3-70B: 64 attention heads nhưng chỉ 8 KV heads → Giảm KV cache 8x!
+- Qwen2.5-7B: 28 attention heads nhưng chỉ 4 KV heads → Giảm KV cache 7x!
+
+### Ví dụ thực tế: Production Mix trên H100-80GB
+
+**Giả định:**
+- GPU: H100-80GB (90% utilization = 72GB available)
+- Average sequence length: 12K tokens (input + output)
+- Precision: FP8 weights, FP16 KV cache
+
+#### Case 17: GLM-4-9B với Batch Size 128 (Best Case)
+
+**Thông số:**
+- Parameters: 9B
+- Layers: 40
+- Hidden size: 4096
+- Num attention heads: 32
+- **Num KV heads: 2** (GQA ratio 16:1)
+- Head dim: 128
+- Max context: 128K
+- Batch size: 128
+- Avg sequence: 12K tokens
+
+**Tính toán:**
+
+```
+Model Weights (FP8) = 9B × 1 = 9 GB
+
+KV Cache (FP16, GQA) = 2 × 40 × 128 × 12,288 × (2 × 128) × 2
+                      = 2 × 40 × 128 × 12,288 × 256 × 2
+                      ≈ 40.3 GB
+
+Activations ≈ 1.5 GB
+
+Overhead (15%) = (9 + 40.3 + 1.5) × 0.15 = 7.6 GB
+
+Total VRAM = 9 + 40.3 + 1.5 + 7.6 = 58.4 GB
+```
+
+**Kết luận:** ✅ Vừa khít với H100-80GB, có thể serve batch size 128!
+
+**vLLM Command:**
+```bash
+vllm serve THUDM/glm-4-9b \
+  --max-model-len 131072 \
+  --max-num-seqs 128 \
+  --gpu-memory-utilization 0.90 \
+  --dtype float8
+```
+
+---
+
+#### Case 18: Qwen2.5-7B-Instruct với Batch Size 120
+
+**Thông số:**
+- Parameters: 7B
+- Layers: 28
+- Hidden size: 3584
+- Num attention heads: 28
+- **Num KV heads: 4** (GQA ratio 7:1)
+- Head dim: 128
+- Max context: 32K
+- Batch size: 120 (giảm từ 128 để safe margin)
+- Avg sequence: 12K tokens
+
+**Tính toán:**
+
+```
+Model Weights (FP8) = 7B × 1 = 7 GB
+
+KV Cache (FP16, GQA) = 2 × 28 × 120 × 12,288 × (4 × 128) × 2
+                      ≈ 52.3 GB
+
+Activations ≈ 1.2 GB
+
+Overhead (15%) = (7 + 52.3 + 1.2) × 0.15 = 9.1 GB
+
+Total VRAM = 7 + 52.3 + 1.2 + 9.1 = 69.6 GB
+```
+
+**Kết luận:** ✅ Safe với H100-80GB, có dư ~10GB cho spikes.
+
+**vLLM Command:**
+```bash
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --max-model-len 32768 \
+  --max-num-seqs 120 \
+  --gpu-memory-utilization 0.90 \
+  --dtype float8
+```
+
+---
+
+#### Case 19: Qwen3-32B với Batch Size 20 (Limited Throughput)
+
+**Thông số:**
+- Parameters: 32.8B
+- Layers: 64
+- Hidden size: 5120
+- Num attention heads: 64
+- **Num KV heads: 8** (GQA ratio 8:1)
+- Head dim: 80
+- Max context: 128K
+- Batch size: 20 (constrained bởi VRAM)
+- Avg sequence: 12K tokens
+
+**Tính toán:**
+
+```
+Model Weights (FP8) = 32.8B × 1 = 32.8 GB
+
+KV Cache (FP16, GQA) = 2 × 64 × 20 × 12,288 × (8 × 80) × 2
+                      ≈ 29.3 GB
+
+Activations ≈ 1.8 GB
+
+Overhead (15%) = (32.8 + 29.3 + 1.8) × 0.15 = 9.6 GB
+
+Total VRAM = 32.8 + 29.3 + 1.8 + 9.6 = 73.5 GB
+```
+
+**Kết luận:** ⚠️ Batch size rất nhỏ (20), throughput bị giới hạn nghiêm trọng. Consider multi-GPU setup.
+
+**vLLM Command:**
+```bash
+vllm serve Qwen/Qwen3-32B \
+  --max-model-len 131072 \
+  --max-num-seqs 20 \
+  --gpu-memory-utilization 0.92 \
+  --dtype float8
+```
+
+---
+
+#### Case 20: Gemma-3-27B-IT với Batch Size 24
+
+**Thông số:**
+- Parameters: 27B
+- Layers: 46
+- Hidden size: 4096
+- Num attention heads: 64
+- **Num KV heads: 16** (GQA ratio 4:1)
+- Head dim: 64
+- Max context: 32K
+- Batch size: 24
+- Avg sequence: 12K tokens
+
+**Tính toán:**
+
+```
+Model Weights (FP8) = 27B × 1 = 27 GB
+
+KV Cache (FP16, GQA) = 2 × 46 × 24 × 12,288 × (16 × 64) × 2
+                      ≈ 33.1 GB
+
+Activations ≈ 1.5 GB
+
+Overhead (15%) = (27 + 33.1 + 1.5) × 0.15 = 9.2 GB
+
+Total VRAM = 27 + 33.1 + 1.5 + 9.2 = 70.8 GB
+```
+
+**Kết luận:** ⚠️ Batch size thấp (24), không tối ưu cho production throughput cao.
+
+**vLLM Command:**
+```bash
+vllm serve google/gemma-3-27b-it \
+  --max-model-len 32768 \
+  --max-num-seqs 24 \
+  --gpu-memory-utilization 0.90 \
+  --dtype float8
+```
+
+---
+
+#### Case 21: QwQ-32B với Batch Size 20
+
+**Thông số:**
+- Parameters: 32B
+- Layers: 64
+- Hidden size: 5120
+- Num attention heads: 40
+- **Num KV heads: 8** (GQA ratio 5:1)
+- Head dim: 128
+- Max context: 32K
+- Batch size: 20
+- Avg sequence: 12K tokens
+
+**Tính toán:**
+
+```
+Model Weights (FP8) = 32B × 1 = 32 GB
+
+KV Cache (FP16, GQA) = 2 × 64 × 20 × 12,288 × (8 × 128) × 2
+                      ≈ 31.5 GB
+
+Activations ≈ 1.8 GB
+
+Overhead (15%) = (32 + 31.5 + 1.8) × 0.15 = 9.8 GB
+
+Total VRAM = 32 + 31.5 + 1.8 + 9.8 = 75.1 GB
+```
+
+**Kết luận:** ⚠️ Vừa khít với H100-80GB nhưng batch size chỉ 20. Consider giảm average sequence length hoặc multi-GPU.
+
+**vLLM Command:**
+```bash
+vllm serve Qwen/QwQ-32B-Preview \
+  --max-model-len 32768 \
+  --max-num-seqs 20 \
+  --gpu-memory-utilization 0.93 \
+  --dtype float8
+```
+
+---
+
+#### Case 22: Llama-3.3-70B-Instruct - Không khả thi Single GPU
+
+**Thông số:**
+- Parameters: 70B
+- Layers: 80
+- Hidden size: 8192
+- Num attention heads: 64
+- **Num KV heads: 8** (GQA ratio 8:1)
+- Head dim: 128
+- Max context: 128K
+
+**Tính toán (batch size = 1):**
+
+```
+Model Weights (FP8) = 70B × 1 = 70 GB
+
+KV Cache (FP16, GQA, batch=1) = 2 × 80 × 1 × 12,288 × (8 × 128) × 2
+                                ≈ 2.5 GB
+
+Activations ≈ 0.5 GB
+
+Overhead (15%) = (70 + 2.5 + 0.5) × 0.15 = 10.9 GB
+
+Total VRAM = 70 + 2.5 + 0.5 + 10.9 = 83.9 GB
+```
+
+**Kết luận:** ❌ Ngay cả với batch size 1, vẫn vượt H100-80GB. **Bắt buộc phải dùng 2x H100 với Tensor Parallelism.**
+
+**vLLM Command (2x H100):**
+```bash
+vllm serve meta-llama/Llama-3.3-70B-Instruct \
+  --max-model-len 131072 \
+  --max-num-seqs 64 \
+  --gpu-memory-utilization 0.90 \
+  --dtype float8 \
+  --tensor-parallel-size 2
+```
+
+---
+
+### Bảng tổng hợp: Batch Size tối ưu cho H100-80GB
+
+| Model | Max Context | **Khuyến nghị Batch Size** | Total VRAM | Throughput | Multi-GPU? |
+|-------|-------------|---------------------------|------------|------------|------------|
+| **GLM-4-9B** | 128K | **128** ✅ | 58.4 GB | Excellent | No |
+| **Qwen2.5-7B-Instruct** | 32K | **120** ✅ | 69.6 GB | Excellent | No |
+| **Gemma-3-27B-IT** | 32K | **24** ⚠️ | 70.8 GB | Limited | Recommended |
+| **Qwen3-32B** | 128K | **20** ⚠️ | 73.5 GB | Poor | Recommended |
+| **QwQ-32B** | 32K | **20** ⚠️ | 75.1 GB | Poor | Recommended |
+| **Llama-3.3-70B** | 128K | **Không khả thi** ❌ | 83.9 GB | - | Required (2x+) |
+
+**Lưu ý quan trọng:**
+- ✅ **Excellent throughput**: Batch size ≥100, phù hợp production traffic cao
+- ⚠️ **Limited/Poor throughput**: Batch size <30, cân nhắc multi-GPU hoặc giảm average sequence length
+- ❌ **Không khả thi**: Model weights alone vượt 80GB, bắt buộc tensor parallelism
+
+---
+
+### Chiến lược tối ưu hóa cho Production
+
+#### 1. Giảm Average Sequence Length
+
+Nếu có thể giảm average sequence từ 12K → 8K tokens:
+
+```python
+# Ví dụ: Qwen3-32B với 8K average tokens
+KV Cache = 2 × 64 × 20 × 8,192 × (8 × 80) × 2 ≈ 19.5 GB  # Giảm từ 29.3 GB
+Total VRAM ≈ 63 GB  # Tiết kiệm 10.5 GB
+
+# → Có thể tăng batch size lên 30 (+50% throughput!)
+```
+
+**Cách thực hiện:**
+- Implement smart chunking cho long documents
+- Optimize prompt engineering để giảm context
+- Sử dụng sliding window attention
+
+#### 2. Multi-GPU Tensor Parallelism
+
+Cho models >30B parameters với batch size yêu cầu cao:
+
+```bash
+# Qwen3-32B trên 2x H100-80GB
+vllm serve Qwen/Qwen3-32B \
+  --max-model-len 131072 \
+  --max-num-seqs 80 \        # Tăng từ 20 → 80 (4x throughput!)
+  --gpu-memory-utilization 0.90 \
+  --dtype float8 \
+  --tensor-parallel-size 2
+
+# Model weights: 32.8 GB / 2 = 16.4 GB per GPU
+# KV Cache: Shared across GPUs
+# Total per GPU: ~50-55 GB → Còn nhiều dư!
+```
+
+#### 3. Mixed Batch Processing
+
+Kết hợp requests với sequence lengths khác nhau:
+
+```python
+# vLLM tự động optimize
+# 70% requests: 4K tokens
+# 20% requests: 8K tokens
+# 10% requests: 16K tokens
+# → Effective average: ~6K tokens (giảm từ 12K)
+# → Tăng batch size capacity ~2x!
+```
+
+#### 4. FP8 Quantization cho H100
+
+H100 có Transformer Engine hỗ trợ FP8 native:
+
+```bash
+# Với FP8 quantization:
+# - Model weights: Giảm từ FP16 (2 bytes) → FP8 (1 byte) = 50% savings
+# - KV Cache: Vẫn FP16 (cần accuracy cao)
+# - Minimal quality loss (<1% perplexity)
+
+vllm serve <model> \
+  --dtype float8 \              # Bật FP8 cho weights
+  --kv-cache-dtype fp16         # Giữ FP16 cho KV cache (accuracy)
+```
+
+---
+
+### Monitoring và Debugging Commands
+
+```bash
+# 1. Real-time VRAM monitoring
+watch -n 1 nvidia-smi
+
+# 2. vLLM memory profiling
+vllm serve <model> --enable-prefix-caching --log-level debug
+
+# 3. Check actual batch size và throughput
+curl http://localhost:8000/metrics | grep vllm_num_requests
+
+# 4. Analyze KV cache usage
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv -l 1
+```
+
+---
+
+### Best Practices Summary
+
+**✅ DO:**
+- Sử dụng GQA-enabled models (Llama 3, Qwen 2.5, Gemma 3)
+- Enable FP8 quantization trên H100
+- Monitor average sequence length trong production
+- Sử dụng vLLM continuous batching
+- Set `--gpu-memory-utilization 0.90` để dành buffer cho spikes
+
+**❌ DON'T:**
+- Không assume batch_size=128 cho mọi model
+- Không quên tính KV cache với actual sequence length
+- Không dùng FP8 cho KV cache (quality loss đáng kể)
+- Không ignore GQA ratio khi tính toán
+
+---
+
 ## Tài liệu tham khảo
 
 - [SkyMod - Practical Guide to Inference VRAM Consumption](https://skymod.tech/how-much-memory-does-your-llm-really-need-a-practical-guide-to-inference-vram-consumption/)
 - [vLLM Documentation](https://docs.vllm.ai/)
 - [Hugging Face TGI](https://github.com/huggingface/text-generation-inference)
 - [NVIDIA TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
+- [GQA Paper: Fast Transformer Decoding](https://arxiv.org/abs/2305.13245)
+- [H100 Transformer Engine Guide](https://docs.nvidia.com/deeplearning/transformer-engine/)
