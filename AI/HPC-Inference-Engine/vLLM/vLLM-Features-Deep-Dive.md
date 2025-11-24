@@ -2,15 +2,16 @@
 
 ## Mục Lục
 1. [Giới Thiệu](#giới-thiệu)
-2. [Paged Attention](#1-paged-attention)
-3. [Continuous Batching](#2-continuous-batching)
-4. [Distributed Inference](#3-distributed-inference)
-5. [Chunked Prefill Scheduling](#4-chunked-prefill-scheduling)
-6. [Automatic Prefix Caching](#5-automatic-prefix-caching)
-7. [Model Quantization với LLM Compressor](#6-model-quantization-với-llm-compressor)
-8. [Context Parallelism](#7-context-parallelism)
-9. [Disaggregated Prefill and Decode](#8-disaggregated-prefill-and-decode)
-10. [Kết Luận và So Sánh](#kết-luận-và-so-sánh)
+2. [vLLM V1 Architecture](#vllm-v1-architecture)
+3. [Paged Attention](#1-paged-attention)
+4. [Continuous Batching](#2-continuous-batching)
+5. [Distributed Inference](#3-distributed-inference)
+6. [Chunked Prefill Scheduling](#4-chunked-prefill-scheduling)
+7. [Automatic Prefix Caching](#5-automatic-prefix-caching)
+8. [Model Quantization với LLM Compressor](#6-model-quantization-với-llm-compressor)
+9. [Context Parallelism](#7-context-parallelism)
+10. [Disaggregated Prefill and Decode](#8-disaggregated-prefill-and-decode)
+11. [Kết Luận và So Sánh](#kết-luận-và-so-sánh)
 
 ---
 
@@ -62,6 +63,649 @@
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                   │
 └─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## vLLM V1 Architecture
+
+### Tổng Quan V1 vs V0
+
+vLLM V1 (released January 2025) là một **major redesign** của core architecture, tập trung vào scheduler, memory manager, và distributed architecture. V1 không thay đổi APIs, models, kernels, mà chỉ cải thiện internal engine.
+
+#### Các Mục Tiêu Chính của V1
+
+1. **Simple, modular, easy-to-hack codebase**: Dễ dàng mở rộng và customize
+2. **Near-zero CPU overhead**: Giảm thiểu bottleneck từ Python code
+3. **Unified architecture**: Kết hợp các optimizations vào một kiến trúc thống nhất
+4. **Zero-config defaults**: Tự động enable các features/optimizations
+
+#### Performance Improvements
+
+```
+vLLM V1 vs V0 Benchmark:
+
+Metric                    | V0         | V1         | Improvement
+--------------------------|------------|------------|-------------
+Throughput (tok/s)        | 1000       | 1700       | 1.7x
+Prefix Cache Overhead     | 5-15%      | <1%        | Near-zero
+CPU Overhead              | High       | Near-zero  | Significant
+Multi-modal Processing    | Sequential | Parallel   | 2-3x faster
+```
+
+### V1 Scheduler: Unified Token-Based Design
+
+#### Core Design: Loại Bỏ Prefill/Decode Distinction
+
+V1 scheduler **không phân biệt** prefill và decode phases. Thay vào đó, tất cả tokens được xử lý như nhau thông qua một **dictionary mapping**:
+
+```python
+# V1 Scheduling Decision
+scheduling_decision = {
+    request_id_1: num_tokens_to_process,  # e.g., 512 (prefill chunk)
+    request_id_2: 1,                       # e.g., 1 (decode token)
+    request_id_3: 256,                     # e.g., 256 (prefill chunk)
+    ...
+}
+
+# V0 Scheduling (OLD - separate prefill/decode)
+# - Either process prefills OR decodes in a step
+# - Cannot mix efficiently
+
+# V1 Scheduling (NEW - unified)
+# - Mix prefills and decodes in same step
+# - Single token budget for all requests
+```
+
+#### Two-Queue Prioritization Model
+
+```python
+class V1Scheduler:
+    """
+    V1 Scheduler với two-queue model
+
+    Queues:
+    - waiting: Requests chờ prefill (FIFO hoặc priority)
+    - running: Requests đang decode (prioritized)
+
+    Key Innovation:
+    - Decode requests ALWAYS prioritized (lower latency)
+    - Prefill và decode có thể mix trong cùng batch
+    """
+
+    def __init__(self, config):
+        self.waiting = []      # Queue for new requests
+        self.running = []      # Queue for running requests
+        self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.policy = config.scheduling_policy  # "fcfs" or "priority"
+
+    def schedule(self) -> Dict[str, int]:
+        """
+        Main scheduling algorithm
+
+        Returns:
+            Dict mapping request_id → num_tokens to process
+        """
+        schedule_decision = {}
+        token_budget = self.max_num_batched_tokens
+
+        # Step 1: ALWAYS prioritize decode requests (running queue)
+        # This ensures low inter-token latency
+        for request in self.running:
+            if request.is_finished():
+                continue
+
+            # Decode: always 1 token
+            if token_budget >= 1:
+                schedule_decision[request.id] = 1
+                token_budget -= 1
+
+        # Step 2: Add prefill requests from waiting queue
+        # Fill remaining budget with prefill chunks
+        for request in self.waiting:
+            if token_budget <= 0:
+                break
+
+            remaining_prefill = request.get_remaining_prefill_len()
+
+            # Chunked prefill: cap at chunk_size
+            chunk_size = min(remaining_prefill, self.chunk_size, token_budget)
+
+            if chunk_size > 0:
+                schedule_decision[request.id] = chunk_size
+                token_budget -= chunk_size
+
+                # Move to running if prefill complete
+                if chunk_size >= remaining_prefill:
+                    self.waiting.remove(request)
+                    self.running.append(request)
+
+        return schedule_decision
+```
+
+#### Flattened Sequence Representation
+
+V1 sử dụng **flattened sequences** thay vì padded batches:
+
+```
+Traditional Batching (Padded):
+┌──────────────────────────────────────┐
+│ Seq1: [tok1, tok2, tok3, PAD, PAD]  │
+│ Seq2: [tok1, tok2, PAD, PAD, PAD]   │
+│ Seq3: [tok1, tok2, tok3, tok4, tok5] │
+└──────────────────────────────────────┘
+Shape: (3, 5) - wasted computation on PAD tokens
+
+V1 Flattened (No Padding):
+┌──────────────────────────────────────────────────────────┐
+│ [tok1_s1, tok2_s1, tok3_s1, tok1_s2, tok2_s2, tok1_s3...] │
+│ Position indices: [0, 1, 2, 0, 1, 0, 1, 2, 3, 4]         │
+│ Sequence IDs:     [1, 1, 1, 2, 2, 3, 3, 3, 3, 3]         │
+└──────────────────────────────────────────────────────────┘
+Shape: (10,) - no wasted computation
+
+Benefits:
+- Zero padding overhead
+- Flexible batch composition
+- Efficient continuous batching
+```
+
+### V1 Block Manager: Optimized KV Cache
+
+#### Block Structure
+
+```python
+class KVCacheBlock:
+    """
+    Physical block in KV cache
+
+    Memory Layout:
+    block_memory = 2 × block_size × num_kv_heads × head_size × dtype_bytes
+
+    Example (LLaMA-2 70B, block_size=16, FP16):
+    - num_kv_heads = 8 (GQA)
+    - head_size = 128
+    - block_memory = 2 × 16 × 8 × 128 × 2 = 64 KB per block
+
+    For 80GB GPU with 50% for KV cache:
+    - Available: 40 GB
+    - Num blocks: 40 GB / 64 KB ≈ 625,000 blocks
+    - Max tokens: 625,000 × 16 = 10M tokens
+    """
+
+    def __init__(self, block_id: int, block_size: int = 16):
+        self.block_id = block_id
+        self.block_size = block_size
+        self.ref_count = 0
+        self.last_accessed = 0
+        self.hash = None  # For prefix caching
+```
+
+#### Block Allocation với Constant-Time Operations
+
+```python
+class V1BlockManager:
+    """
+    V1 Block Manager với optimized data structures
+
+    Key Improvements over V0:
+    1. Doubly-linked list for O(1) block allocation/deallocation
+    2. Hash-based prefix caching với near-zero overhead
+    3. No swapping needed (preemption instead)
+    """
+
+    def __init__(self, num_blocks: int, block_size: int = 16):
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+
+        # Doubly-linked list for O(1) operations
+        self.free_block_queue = DoublyLinkedList()
+        for i in range(num_blocks):
+            self.free_block_queue.append(i)
+
+        # Request → blocks mapping
+        self.req_to_blocks: Dict[str, List[int]] = {}
+
+        # Hash table for prefix caching (V1 improvement)
+        self.hash_to_block: Dict[int, int] = {}
+        self.block_to_hash: Dict[int, int] = {}
+
+    def allocate_slots(self, request_id: str, num_tokens: int) -> List[int]:
+        """
+        Allocate KV cache slots for new tokens
+
+        Time Complexity: O(num_blocks_needed)
+        - V0: O(n) traversal
+        - V1: O(1) per block via linked list
+        """
+        num_blocks_needed = math.ceil(num_tokens / self.block_size)
+
+        # Check availability
+        if len(self.free_block_queue) < num_blocks_needed:
+            # Trigger preemption (no swapping in V1)
+            self._preempt_lowest_priority()
+
+        # Allocate from free pool
+        allocated = []
+        for _ in range(num_blocks_needed):
+            block_id = self.free_block_queue.pop_front()  # O(1)
+            allocated.append(block_id)
+
+        # Update mapping
+        if request_id not in self.req_to_blocks:
+            self.req_to_blocks[request_id] = []
+        self.req_to_blocks[request_id].extend(allocated)
+
+        return allocated
+
+    def free_blocks(self, request_id: str):
+        """Free blocks when request completes"""
+        blocks = self.req_to_blocks.pop(request_id, [])
+        for block_id in blocks:
+            # Check if block is used by prefix cache
+            if block_id not in self.hash_to_block.values():
+                self.free_block_queue.append(block_id)  # O(1)
+```
+
+### V1 Multiprocessing Architecture
+
+#### Process Layout
+
+```
+V1 Multiprocessing Architecture:
+
+Single GPU (TP=1):
+┌─────────────────────────────────────────┐
+│              Driver Process              │
+│  ┌─────────────────────────────────┐    │
+│  │      AsyncLLM (API Layer)        │    │
+│  └─────────────────────────────────┘    │
+│                   ↓ IPC                  │
+│  ┌─────────────────────────────────┐    │
+│  │    EngineCore (Scheduler +       │    │
+│  │    Block Manager)                │    │
+│  └─────────────────────────────────┘    │
+│                   ↓                      │
+│  ┌─────────────────────────────────┐    │
+│  │         Worker Process           │    │
+│  │    (GPU 0, Model Executor)       │    │
+│  └─────────────────────────────────┘    │
+└─────────────────────────────────────────┘
+
+Multi-GPU (TP=4):
+┌─────────────────────────────────────────┐
+│              Driver Process              │
+│  ┌─────────────────────────────────┐    │
+│  │      AsyncLLM (API Layer)        │    │
+│  └─────────────────────────────────┘    │
+│                   ↓ IPC                  │
+│  ┌─────────────────────────────────┐    │
+│  │    EngineCore (Scheduler +       │    │
+│  │    Block Manager)                │    │
+│  └─────────────────────────────────┘    │
+│         ↓ RPC Broadcast Queue           │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐   │
+│  │Worker│ │Worker│ │Worker│ │Worker│   │
+│  │ GPU0 │ │ GPU1 │ │ GPU2 │ │ GPU3 │   │
+│  └──────┘ └──────┘ └──────┘ └──────┘   │
+└─────────────────────────────────────────┘
+
+Key V1 Improvement:
+- Scheduler và Worker 0 trong SEPARATE processes
+- Symmetric architecture (mỗi worker giống nhau)
+- Only incremental state updates transmitted
+```
+
+#### Incremental State Updates
+
+```python
+class V1IncrementalState:
+    """
+    V1 truyền ONLY incremental changes (diffs) mỗi step
+
+    V0 Problem:
+    - Send full request state every step
+    - High IPC overhead for large batches
+
+    V1 Solution:
+    - Cache state on workers
+    - Only send diffs: new tokens, finished requests
+    """
+
+    def compute_diff(self, prev_state, curr_state):
+        """
+        Compute minimal diff between states
+
+        Diff contains:
+        - New requests (added to running)
+        - Finished requests (to remove)
+        - New tokens for each request (1 for decode)
+        - Updated block mappings
+        """
+        diff = {
+            'new_requests': [],
+            'finished_requests': [],
+            'new_tokens': {},  # request_id → [new_token_ids]
+            'new_blocks': {},  # request_id → [new_block_ids]
+        }
+
+        # Find new requests
+        for req_id in curr_state.requests:
+            if req_id not in prev_state.requests:
+                diff['new_requests'].append(curr_state.requests[req_id])
+
+        # Find finished requests
+        for req_id in prev_state.requests:
+            if req_id not in curr_state.requests:
+                diff['finished_requests'].append(req_id)
+
+        # Find new tokens (for decode)
+        for req_id, request in curr_state.requests.items():
+            if req_id in prev_state.requests:
+                prev_len = len(prev_state.requests[req_id].tokens)
+                curr_len = len(request.tokens)
+                if curr_len > prev_len:
+                    diff['new_tokens'][req_id] = request.tokens[prev_len:]
+
+        return diff
+```
+
+#### Persistent Batch Technique
+
+```python
+class PersistentBatch:
+    """
+    V1 caches input tensors và chỉ apply incremental changes
+
+    V0: Rebuild tensors from scratch mỗi step
+    V1: Maintain persistent tensors, update in-place
+
+    Benefits:
+    - Avoid Python object creation overhead
+    - Use NumPy operations instead of Python loops
+    - Enable CUDA Graph capture
+    """
+
+    def __init__(self, max_batch_size: int, max_seq_len: int):
+        # Persistent tensors (pre-allocated)
+        self.input_ids = np.zeros(max_batch_size * max_seq_len, dtype=np.int32)
+        self.positions = np.zeros(max_batch_size * max_seq_len, dtype=np.int32)
+        self.slot_mapping = np.zeros(max_batch_size * max_seq_len, dtype=np.int32)
+
+        # Current state
+        self.num_tokens = 0
+        self.request_indices = {}  # request_id → (start_idx, end_idx)
+
+    def update_with_diff(self, diff: dict):
+        """
+        Apply incremental diff to persistent batch
+
+        Uses NumPy vectorized operations for speed
+        """
+        # Remove finished requests
+        for req_id in diff['finished_requests']:
+            start, end = self.request_indices.pop(req_id)
+            # Shift remaining data
+            remaining = self.num_tokens - end
+            self.input_ids[start:start+remaining] = self.input_ids[end:self.num_tokens]
+            self.num_tokens -= (end - start)
+            # Update indices for shifted requests
+            for other_id, (s, e) in self.request_indices.items():
+                if s > start:
+                    self.request_indices[other_id] = (s - (end - start), e - (end - start))
+
+        # Add new tokens (NumPy vectorized)
+        for req_id, new_tokens in diff['new_tokens'].items():
+            start, end = self.request_indices[req_id]
+            new_end = end + len(new_tokens)
+            self.input_ids[end:new_end] = new_tokens
+            self.request_indices[req_id] = (start, new_end)
+            self.num_tokens += len(new_tokens)
+```
+
+### V1 Prefix Caching: Near-Zero Overhead
+
+#### Hash-Based Approach (V1) vs Tree-Based (SGLang)
+
+```
+vLLM V1: Hash Table-Based Prefix Caching
+─────────────────────────────────────────
+Data Structure: Hash table (dict)
+Key: hash(token_ids in block + prefix_hash)
+Value: physical_block_id
+
+Advantages:
+✅ O(1) lookup, insert, delete
+✅ Near-zero overhead when cache miss
+✅ Simple implementation
+✅ Works well with block-based memory
+
+Disadvantages:
+❌ Cannot find partial prefix matches
+❌ Fixed granularity (block-level)
+
+─────────────────────────────────────────
+
+SGLang: Radix Tree-Based (RadixAttention)
+─────────────────────────────────────────
+Data Structure: Radix tree (prefix tree with compressed edges)
+Key: Token sequence as path from root
+Value: KV cache tensors at nodes
+
+Advantages:
+✅ Token-level granularity
+✅ Find longest prefix match efficiently
+✅ Better for variable-length common prefixes
+
+Disadvantages:
+❌ Higher memory overhead (tree structure)
+❌ More complex implementation
+❌ Traversal overhead for each lookup
+```
+
+#### V1 Prefix Caching Implementation
+
+```python
+class V1PrefixCaching:
+    """
+    V1 Hash-based prefix caching
+
+    Key Observation:
+    Each KV block can be uniquely identified by:
+    1. Tokens within the block
+    2. Tokens in the prefix BEFORE the block
+
+    Hash Function:
+    block_hash = hash(prefix_hash, tokens_in_block)
+
+    This ensures:
+    - Same prefix + same tokens = same hash
+    - Different prefix = different hash (even with same tokens)
+    """
+
+    def __init__(self, block_manager):
+        self.block_manager = block_manager
+        self.hash_to_block: Dict[int, int] = {}
+        self.block_to_hash: Dict[int, int] = {}
+        self.block_last_accessed: Dict[int, float] = {}
+
+    def compute_block_hash(self, prefix_hash: int, block_tokens: List[int]) -> int:
+        """
+        Compute hash for a block
+
+        Hash includes:
+        - Previous blocks' hash (chain)
+        - Current block's tokens
+        """
+        # Use tuple hashing for stability
+        return hash((prefix_hash, tuple(block_tokens)))
+
+    def lookup_prefix(self, token_ids: List[int]) -> Tuple[int, List[int]]:
+        """
+        Find cached blocks for token sequence
+
+        Returns:
+            (num_cached_tokens, cached_block_ids)
+        """
+        cached_blocks = []
+        prefix_hash = 0
+        block_size = self.block_manager.block_size
+
+        for i in range(0, len(token_ids), block_size):
+            block_tokens = token_ids[i:i + block_size]
+
+            # Only check complete blocks
+            if len(block_tokens) < block_size:
+                break
+
+            block_hash = self.compute_block_hash(prefix_hash, block_tokens)
+
+            if block_hash in self.hash_to_block:
+                # Cache hit!
+                block_id = self.hash_to_block[block_hash]
+                cached_blocks.append(block_id)
+                self.block_last_accessed[block_id] = time.time()
+                prefix_hash = block_hash  # Chain for next block
+            else:
+                # Cache miss - stop here
+                break
+
+        return len(cached_blocks) * block_size, cached_blocks
+
+    def insert_blocks(self, token_ids: List[int], block_ids: List[int]):
+        """
+        Insert computed blocks into cache
+        """
+        prefix_hash = 0
+        block_size = self.block_manager.block_size
+
+        for i, block_id in enumerate(block_ids):
+            start = i * block_size
+            block_tokens = token_ids[start:start + block_size]
+
+            if len(block_tokens) == block_size:
+                block_hash = self.compute_block_hash(prefix_hash, block_tokens)
+                self.hash_to_block[block_hash] = block_id
+                self.block_to_hash[block_id] = block_hash
+                self.block_last_accessed[block_id] = time.time()
+                prefix_hash = block_hash
+
+    def evict(self, num_blocks_needed: int):
+        """
+        LRU eviction policy
+
+        V1 Optimization:
+        - Constant-time eviction via sorted structure
+        - Prioritize evicting blocks at end of longest prefix
+        """
+        # Get eviction candidates (ref_count == 0)
+        candidates = [
+            (block_id, self.block_last_accessed[block_id])
+            for block_id, hash_val in self.block_to_hash.items()
+            if self.block_manager.get_ref_count(block_id) == 0
+        ]
+
+        # Sort by last accessed (LRU)
+        candidates.sort(key=lambda x: x[1])
+
+        evicted = []
+        for block_id, _ in candidates[:num_blocks_needed]:
+            # Remove from cache
+            block_hash = self.block_to_hash.pop(block_id)
+            del self.hash_to_block[block_hash]
+            del self.block_last_accessed[block_id]
+
+            # Return to free pool
+            self.block_manager.free_block(block_id)
+            evicted.append(block_id)
+
+        return evicted
+```
+
+### V1 Forward Pass Pipeline
+
+```
+V1 Forward Pass (5 Stages):
+═══════════════════════════════════════════════════════════════
+
+Stage 1: State Updates
+────────────────────────
+• Prune finished requests from input_batch
+• Update request metadata
+• Apply incremental diffs
+
+Stage 2: Input Preparation
+────────────────────────
+• Copy tensors CPU → GPU
+• Compute position indices
+• Build slot_mapping for paged attention
+• Flatten sequences into "super sequence"
+
+Stage 3: Model Execution
+────────────────────────
+• Run transformer layers
+• Paged attention kernels access KV via slot_mapping
+• All sequences computed in single forward pass
+
+Stage 4: Token Extraction
+────────────────────────
+• Extract hidden states at final position of each sequence
+• Compute logits via lm_head
+
+Stage 5: Sampling
+────────────────────────
+• Sample next tokens according to sampling config
+• Apply temperature, top-p, top-k
+• Update sequences with new tokens
+
+═══════════════════════════════════════════════════════════════
+
+Execution Modes:
+
+1. Eager Mode:
+   • Standard PyTorch execution
+   • Flexible, easier debugging
+   • Higher kernel launch overhead
+
+2. CUDA Graph Mode:
+   • Pre-captured execution graphs
+   • Eliminates kernel launch overhead
+   • Fixed batch shape (requires padding)
+   • 10-30% latency improvement
+```
+
+### V1 Summary
+
+```
+vLLM V1 Key Improvements Summary:
+═══════════════════════════════════════════════════════════════
+
+1. Unified Scheduler
+   - No prefill/decode distinction
+   - Simple {request_id: num_tokens} representation
+   - Decode always prioritized
+
+2. Near-Zero Prefix Caching Overhead
+   - Hash-based lookup (O(1))
+   - <1% throughput impact at 0% hit rate
+   - Enabled by default
+
+3. Symmetric Multiprocessing
+   - Scheduler in separate process from all workers
+   - Incremental state updates only
+   - Reduced IPC overhead
+
+4. Persistent Batch
+   - Pre-allocated tensors
+   - NumPy vectorized updates
+   - CUDA Graph compatible
+
+5. Performance
+   - 1.7x throughput vs V0
+   - Consistent latency
+   - Better multi-modal support
+
+═══════════════════════════════════════════════════════════════
 ```
 
 ---
@@ -2657,7 +3301,30 @@ Emerging quantization techniques:
 
 ### 7.1. Vấn Đề: Long Context Bottleneck
 
-Khi context length tăng lên rất lớn (100K - 1M tokens), các chiến lược parallelism hiện tại gặp hạn chế:
+Khi context length tăng lên rất lớn (100K - 1M tokens), các chiến lược parallelism hiện tại gặp hạn chế.
+
+**Context Parallelism** (còn gọi là **Sequence Parallelism**) là kỹ thuật phân tán **sequence dimension** thay vì model weights. vLLM hiện đang tích cực phát triển CP với các approaches khác nhau:
+
+```
+Current vLLM CP Status (2025):
+─────────────────────────────────────────────────────────────────
+
+Implemented:
+✅ Basic CP với All-Gather approach
+✅ Chunked prefill với ring attention
+✅ Integration với TP (Hybrid TP+CP)
+
+In Development:
+🔄 Full Ring Attention optimization
+🔄 Ulysses integration (via Snowflake Arctic)
+🔄 Unified Sequence Parallel (USP) = Ulysses + Ring
+
+Research/RFC:
+📝 RFC #22693: Context Parallelism && Sequence Parallelism
+📝 RFC #26133: Support Context Parallelism with Fully Sharded KV Cache
+```
+
+**Các approaches chính:**
 
 ```
 Long Context Challenges:
@@ -3362,22 +4029,405 @@ llm = LLM(
 )
 ```
 
-### 7.9. Comparison with Other Approaches
+### 7.9. Ulysses vs Ring Attention: Deep Comparison
+
+vLLM đang tích hợp cả hai approaches chính cho Context Parallelism:
+
+#### 7.9.1. Ulysses (DeepSpeed-Ulysses)
+
+**Ý Tưởng:** Ulysses shard attention heads thay vì sequence. Mỗi GPU xử lý một subset của attention heads.
+
+```python
+class UlyssesAttention:
+    """
+    Ulysses Sequence Parallelism
+
+    Key Insight:
+    - Shard Q, K, V theo HEAD dimension
+    - All-to-All để redistribute data
+    - Mỗi GPU compute attention cho subset of heads
+
+    Communication Pattern:
+    1. All-to-All scatter: Q, K, V từ seq-split → head-split
+    2. Local attention computation
+    3. All-to-All gather: Output từ head-split → seq-split
+    """
+
+    def __init__(self, sp_size: int, num_heads: int):
+        self.sp_size = sp_size
+        self.num_heads = num_heads
+        self.heads_per_rank = num_heads // sp_size
+
+    def forward(self, q, k, v):
+        """
+        Ulysses attention forward pass
+
+        Input (sequence-split):
+            q, k, v: (batch, seq_len/sp_size, num_heads, head_dim)
+
+        Step 1: All-to-All to head-split
+            q, k, v: (batch, seq_len, num_heads/sp_size, head_dim)
+
+        Step 2: Local attention (full sequence, partial heads)
+
+        Step 3: All-to-All back to sequence-split
+            output: (batch, seq_len/sp_size, num_heads, head_dim)
+        """
+        batch, seq_chunk, num_heads, head_dim = q.shape
+
+        # Step 1: All-to-All (sequence-split → head-split)
+        # Each GPU sends its seq chunk to all GPUs
+        # Each GPU receives all seq but only its heads
+        q_heads = all_to_all_seq_to_head(q, self.sp_size)
+        k_heads = all_to_all_seq_to_head(k, self.sp_size)
+        v_heads = all_to_all_seq_to_head(v, self.sp_size)
+        # Shape: (batch, seq_len, heads_per_rank, head_dim)
+
+        # Step 2: Local attention (standard FlashAttention)
+        # Full sequence length, but only local heads
+        attn_output = flash_attention(q_heads, k_heads, v_heads)
+        # Shape: (batch, seq_len, heads_per_rank, head_dim)
+
+        # Step 3: All-to-All (head-split → sequence-split)
+        output = all_to_all_head_to_seq(attn_output, self.sp_size)
+        # Shape: (batch, seq_chunk, num_heads, head_dim)
+
+        return output
+
+def all_to_all_seq_to_head(tensor, sp_size):
+    """
+    Redistribute tensor from sequence-split to head-split
+
+    Input:  (batch, seq_len/sp_size, num_heads, head_dim) per GPU
+    Output: (batch, seq_len, num_heads/sp_size, head_dim) per GPU
+    """
+    batch, seq_chunk, num_heads, head_dim = tensor.shape
+    seq_len = seq_chunk * sp_size
+    heads_per_rank = num_heads // sp_size
+
+    # Reshape for all-to-all
+    tensor = tensor.reshape(batch, seq_chunk, sp_size, heads_per_rank, head_dim)
+    tensor = tensor.transpose(1, 2)  # (batch, sp_size, seq_chunk, ...)
+
+    # All-to-All communication
+    output = torch.empty_like(tensor)
+    dist.all_to_all_single(output, tensor)
+
+    # Reshape back
+    output = output.transpose(1, 2).reshape(batch, seq_len, heads_per_rank, head_dim)
+    return output
+```
+
+**Ulysses Communication Pattern:**
+
+```
+Ulysses All-to-All (SP=4, seq=1M, heads=32):
+
+Initial State (sequence-split):
+GPU0: Q[0:250K],   heads[0:32]
+GPU1: Q[250K:500K], heads[0:32]
+GPU2: Q[500K:750K], heads[0:32]
+GPU3: Q[750K:1M],  heads[0:32]
+
+After All-to-All (head-split):
+GPU0: Q[0:1M], heads[0:8]    ← Full sequence, 8 heads
+GPU1: Q[0:1M], heads[8:16]   ← Full sequence, 8 heads
+GPU2: Q[0:1M], heads[16:24]  ← Full sequence, 8 heads
+GPU3: Q[0:1M], heads[24:32]  ← Full sequence, 8 heads
+
+Communication Volume: 2 × All-to-All
+- Each GPU sends: seq_chunk × num_heads × head_dim
+- Each GPU receives: seq_len × heads_per_rank × head_dim
+- Total per GPU: 2 × (seq_len × heads × head_dim) / sp_size
+
+Note: Volume SAME regardless of sequence length!
+```
+
+#### 7.9.2. Ring Attention Detailed
+
+**Ý Tưởng:** Pass K, V chunks in a ring pattern, accumulate partial attention.
+
+```python
+class RingAttentionDetailed:
+    """
+    Ring Attention với Online Softmax
+
+    Key Innovation:
+    - Process K, V in chunks (ring pattern)
+    - Use online softmax to accumulate across chunks
+    - Memory: O(seq_len / cp_size) per GPU
+    """
+
+    def __init__(self, cp_size: int):
+        self.cp_size = cp_size
+        self.cp_rank = dist.get_rank()
+
+    def forward(self, q, k, v):
+        """
+        Ring Attention with online softmax accumulation
+
+        Algorithm:
+        for step in range(cp_size):
+            1. Compute partial attention with current K, V chunk
+            2. Accumulate using online softmax formula
+            3. Ring-shift K, V to next GPU
+        """
+        batch, seq_chunk, num_heads, head_dim = q.shape
+
+        # Initialize accumulators for online softmax
+        # m: running max of attention scores
+        # l: running sum of exp(scores - m)
+        # o: running output (weighted by l)
+        m = torch.full((batch, seq_chunk, num_heads), -float('inf'))
+        l = torch.zeros(batch, seq_chunk, num_heads)
+        o = torch.zeros(batch, seq_chunk, num_heads, head_dim)
+
+        # Current K, V (will be ring-shifted)
+        k_curr = k.clone()
+        v_curr = v.clone()
+
+        for step in range(self.cp_size):
+            # Determine which chunk we're processing
+            chunk_idx = (self.cp_rank - step) % self.cp_size
+
+            # Apply causal mask if needed
+            # (tokens can only attend to earlier tokens)
+            if self.causal:
+                mask = self._compute_causal_mask(
+                    q_chunk_idx=self.cp_rank,
+                    kv_chunk_idx=chunk_idx
+                )
+            else:
+                mask = None
+
+            # === Online Softmax Update ===
+            # Compute attention scores for this K chunk
+            scores = torch.matmul(q, k_curr.transpose(-2, -1)) / math.sqrt(head_dim)
+            # scores: (batch, seq_chunk, num_heads, seq_chunk)
+
+            if mask is not None:
+                scores = scores.masked_fill(mask, -float('inf'))
+
+            # Compute local max and exp
+            m_chunk = scores.max(dim=-1).values  # (batch, seq_chunk, num_heads)
+            exp_scores = torch.exp(scores - m_chunk.unsqueeze(-1))
+            l_chunk = exp_scores.sum(dim=-1)
+
+            # Compute local attention output
+            o_chunk = torch.matmul(exp_scores, v_curr)
+            o_chunk = o_chunk / l_chunk.unsqueeze(-1)
+
+            # === Merge with accumulated state ===
+            # Online softmax: merge new chunk with accumulated
+            m_new = torch.maximum(m, m_chunk)
+
+            # Rescale factors
+            exp_m = torch.exp(m - m_new)
+            exp_m_chunk = torch.exp(m_chunk - m_new)
+
+            # Update accumulator
+            l_new = exp_m * l + exp_m_chunk * l_chunk
+            o_new = (exp_m.unsqueeze(-1) * l.unsqueeze(-1) * o +
+                     exp_m_chunk.unsqueeze(-1) * l_chunk.unsqueeze(-1) * o_chunk) / l_new.unsqueeze(-1)
+
+            # Update state
+            m, l, o = m_new, l_new, o_new
+
+            # === Ring shift K, V to next GPU ===
+            if step < self.cp_size - 1:
+                k_curr = self._ring_send_recv(k_curr)
+                v_curr = self._ring_send_recv(v_curr)
+
+        return o
+
+    def _ring_send_recv(self, tensor):
+        """
+        Ring communication: send to next, receive from previous
+        """
+        send_rank = (self.cp_rank + 1) % self.cp_size
+        recv_rank = (self.cp_rank - 1) % self.cp_size
+
+        recv_tensor = torch.empty_like(tensor)
+
+        # Overlap send/recv
+        send_op = dist.P2POp(dist.isend, tensor, send_rank)
+        recv_op = dist.P2POp(dist.irecv, recv_tensor, recv_rank)
+
+        reqs = dist.batch_isend_irecv([send_op, recv_op])
+        for req in reqs:
+            req.wait()
+
+        return recv_tensor
+```
+
+**Ring Attention Communication Pattern:**
+
+```
+Ring Attention (CP=4, seq=1M):
+
+Step 0: Process local K, V
+GPU0: Q[0:250K] × K[0:250K]     → partial_0
+GPU1: Q[250K:500K] × K[250K:500K] → partial_1
+GPU2: Q[500K:750K] × K[500K:750K] → partial_2
+GPU3: Q[750K:1M] × K[750K:1M]   → partial_3
+
+Step 1: Ring shift K, V (GPU_i sends to GPU_(i+1))
+GPU0 receives K[750K:1M] from GPU3
+GPU1 receives K[0:250K] from GPU0
+GPU2 receives K[250K:500K] from GPU1
+GPU3 receives K[500K:750K] from GPU2
+
+GPU0: Q[0:250K] × K[750K:1M]   → accumulate
+...
+
+Step 2: Ring shift again
+...
+
+Step 3: Final ring shift
+After 4 steps: each GPU has computed attention over full sequence
+
+Communication:
+- cp_size rounds of P2P communication
+- Each round: seq_chunk × num_heads × head_dim × 2 (K and V)
+- Total: seq_len × num_heads × head_dim × 2 (same as data size)
+```
+
+#### 7.9.3. Ulysses vs Ring Attention Comparison
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Ulysses vs Ring Attention Comparison                  │
+├──────────────────────┬──────────────────────┬───────────────────────────┤
+│ Aspect               │ Ulysses              │ Ring Attention            │
+├──────────────────────┼──────────────────────┼───────────────────────────┤
+│ Communication Type   │ All-to-All           │ Point-to-Point (P2P)      │
+│                      │ (collective)         │ (ring pattern)            │
+├──────────────────────┼──────────────────────┼───────────────────────────┤
+│ Communication Volume │ O(seq × heads × dim) │ O(seq × heads × dim)      │
+│                      │ Fixed per step       │ cp_size rounds            │
+├──────────────────────┼──────────────────────┼───────────────────────────┤
+│ Communication Rounds │ 2 All-to-All         │ cp_size P2P rounds        │
+├──────────────────────┼──────────────────────┼───────────────────────────┤
+│ Parallelism Limit    │ num_heads            │ Unlimited                 │
+│                      │ (cannot exceed)      │ (can split arbitrarily)   │
+├──────────────────────┼──────────────────────┼───────────────────────────┤
+│ GQA/MQA Support      │ ❌ Poor              │ ✅ Good                   │
+│                      │ (few KV heads)       │ (split by sequence)       │
+├──────────────────────┼──────────────────────┼───────────────────────────┤
+│ FlashAttention       │ ✅ Optimal           │ ⚠️ Sub-optimal            │
+│ Efficiency           │ (full seq per GPU)   │ (chunked sequences)       │
+├──────────────────────┼──────────────────────┼───────────────────────────┤
+│ Memory per GPU       │ O(seq_len)           │ O(seq_len / cp_size)      │
+│                      │ (full seq needed)    │ (truly distributed)       │
+├──────────────────────┼──────────────────────┼───────────────────────────┤
+│ Bandwidth Util       │ Higher               │ Lower                     │
+│                      │ (AlltoAll optimized) │ (P2P less efficient)      │
+├──────────────────────┼──────────────────────┼───────────────────────────┤
+│ Best For             │ MHA models           │ GQA/MQA models            │
+│                      │ Small CP (2-8)       │ Large CP (8+)             │
+│                      │ NVLink interconnect  │ Any interconnect          │
+└──────────────────────┴──────────────────────┴───────────────────────────┘
+```
+
+#### 7.9.4. Unified Sequence Parallel (USP): Hybrid Approach
+
+**USP kết hợp Ulysses và Ring Attention** để tận dụng ưu điểm của cả hai:
+
+```python
+class UnifiedSequenceParallel:
+    """
+    USP = Ulysses + Ring Attention (Hybrid)
+
+    Strategy:
+    1. First, apply Ulysses up to num_heads
+    2. If more parallelism needed, add Ring Attention on top
+
+    Example: 32 heads, want CP=16
+    - Ulysses: SP=8 (limited by GQA num_kv_heads)
+    - Ring: RP=2 (additional 2x)
+    - Total: 8 × 2 = 16x parallelism
+    """
+
+    def __init__(self, num_heads: int, num_kv_heads: int, total_cp: int):
+        # Ulysses limited by num_kv_heads (for GQA)
+        self.ulysses_size = min(num_kv_heads, total_cp)
+
+        # Ring handles the rest
+        self.ring_size = total_cp // self.ulysses_size
+
+        self.ulysses = UlyssesAttention(self.ulysses_size, num_heads)
+        self.ring = RingAttentionDetailed(self.ring_size)
+
+    def forward(self, q, k, v):
+        """
+        Hybrid execution:
+        1. Ulysses All-to-All to head-split
+        2. Ring attention over sequence chunks
+        3. Ulysses All-to-All back to seq-split
+        """
+        # Step 1: Ulysses scatter (seq-split → head-split)
+        q_heads = self.ulysses.scatter_to_heads(q)
+        k_heads = self.ulysses.scatter_to_heads(k)
+        v_heads = self.ulysses.scatter_to_heads(v)
+
+        # Step 2: Ring attention (if ring_size > 1)
+        if self.ring_size > 1:
+            output = self.ring.forward(q_heads, k_heads, v_heads)
+        else:
+            output = flash_attention(q_heads, k_heads, v_heads)
+
+        # Step 3: Ulysses gather (head-split → seq-split)
+        output = self.ulysses.gather_from_heads(output)
+
+        return output
+```
+
+**USP Topology:**
+
+```
+USP Example: CP=16 = Ulysses(8) × Ring(2)
+
+16 GPUs organized as:
+├── Ring Group 0 (Ulysses 8 GPUs)
+│   ├── GPU 0  (heads 0-3,   seq chunk 0)
+│   ├── GPU 1  (heads 4-7,   seq chunk 0)
+│   ├── GPU 2  (heads 8-11,  seq chunk 0)
+│   ├── GPU 3  (heads 12-15, seq chunk 0)
+│   ├── GPU 4  (heads 16-19, seq chunk 0)
+│   ├── GPU 5  (heads 20-23, seq chunk 0)
+│   ├── GPU 6  (heads 24-27, seq chunk 0)
+│   └── GPU 7  (heads 28-31, seq chunk 0)
+│
+└── Ring Group 1 (Ulysses 8 GPUs)
+    ├── GPU 8  (heads 0-3,   seq chunk 1)
+    ├── GPU 9  (heads 4-7,   seq chunk 1)
+    ...
+    └── GPU 15 (heads 28-31, seq chunk 1)
+
+Communication:
+1. Within each Ring Group: Ulysses All-to-All
+2. Between Ring Groups: Ring attention P2P
+
+Result: 16x sequence parallelism!
+```
+
+### 7.10. Comparison with Other Approaches
 
 | Approach | Context Scaling | Memory | Latency | Complexity |
 |----------|----------------|--------|---------|------------|
 | **Vanilla Attention** | O(N²) | N | O(N²) | Low |
 | **Flash Attention** | O(N²) optimized | N | O(N²) faster | Medium |
 | **Tensor Parallel** | O(N²) | N (replicated) | O(N²) | Medium |
-| **Context Parallel (CP)** | O((N/k)²) per GPU | N/k | O((N/k)²) + comm | High |
-| **Ring Attention** | O((N/k)²) per GPU | N/k | O((N/k)²) + k×comm | Very High |
+| **Ulysses** | O(N²) | N (full seq per GPU) | O(N²) + AlltoAll | Medium |
+| **Ring Attention** | O((N/k)²) per GPU | N/k | O((N/k)²) + k×P2P | High |
+| **USP (Hybrid)** | O((N/k)²) per GPU | N/k | Optimized | Very High |
 
 **When to Use:**
 
 - **Context < 32K:** Standard TP (no CP needed)
-- **32K < Context < 128K:** CP=2 or CP=4 (moderate benefit)
-- **128K < Context < 1M:** CP=4 or CP=8 (high benefit)
-- **Context > 1M:** CP=8+ with Ring Attention (essential)
+- **32K < Context < 128K:** Ulysses (if enough heads) or CP=2-4
+- **128K < Context < 1M:** USP or Ring Attention với CP=4-8
+- **Context > 1M:** USP hoặc Ring Attention với CP=8+ (essential)
 
 ### 7.10. Future Directions
 
@@ -4006,7 +5056,171 @@ if decode_metrics["p99_itl_ms"] > 50:
     # Scale decode instance or investigate bottleneck
 ```
 
-### 8.11. Performance Results
+### 8.11. Meta Production Implementation Details (2025)
+
+Meta đã triển khai vLLM disaggregation trong production và chia sẻ nhiều optimizations quan trọng.
+
+#### Key Optimizations từ Meta
+
+**1. Larger Block Size:**
+
+```python
+# vLLM Default
+block_size = 16  # tokens per block
+
+# Meta Production
+block_size = 128  # or 256
+
+# Rationale:
+# - Smaller blocks → nhiều small kernel launches
+# - KV transfer overhead cao với small blocks
+# - Larger blocks: ít transfers, better throughput
+
+# Trade-off:
+# - Larger blocks: higher memory waste (last block)
+# - Smaller blocks: more flexible memory utilization
+# - For disagg: larger is better (fewer transfers)
+```
+
+**2. Asynchronous KV Loading:**
+
+```python
+class AsyncKVLoader:
+    """
+    Meta's async KV loading: overlap KV load với decode step
+
+    Standard Flow:
+    1. Wait for KV transfer from prefill instance
+    2. Load KV to GPU
+    3. Start decode
+
+    Async Flow:
+    1. Start KV transfer (background)
+    2. While transferring: run decode for OTHER requests
+    3. When transfer complete: add new request to decode batch
+
+    Benefit: Hide KV transfer latency behind decode computation
+    """
+
+    def __init__(self, connector):
+        self.connector = connector
+        self.pending_transfers = {}  # request_id → future
+
+    async def async_load_kv(self, request_id, kv_cache):
+        """Start async KV loading"""
+        future = asyncio.create_task(
+            self.connector.recv_kv_cache_async(request_id, kv_cache)
+        )
+        self.pending_transfers[request_id] = future
+
+    def check_ready(self):
+        """Check which requests have completed KV transfer"""
+        ready = []
+        for req_id, future in list(self.pending_transfers.items()):
+            if future.done():
+                kv_cache = future.result()
+                ready.append((req_id, kv_cache))
+                del self.pending_transfers[req_id]
+        return ready
+
+    def run_decode_with_overlap(self, decode_batch, new_requests):
+        """
+        Run decode while loading KV for new requests
+
+        Timeline:
+        t=0: Start KV load for new_requests (async)
+        t=0: Run decode for decode_batch
+        t=T: Decode complete
+        t=T: Check if KV load complete
+        t=T: Add ready requests to next decode batch
+        """
+        # Start async loads
+        for req in new_requests:
+            self.async_load_kv(req.id, req.kv_cache_placeholder)
+
+        # Run decode (overlapped with KV transfer)
+        outputs = self.model.decode(decode_batch)
+
+        # Check completed transfers
+        ready_requests = self.check_ready()
+
+        return outputs, ready_requests
+```
+
+**3. Connector Types cho Different Deployments:**
+
+```python
+# Meta's Connector Recommendations:
+
+# Single-node (8 GPUs same machine)
+connector_config = {
+    'type': 'SharedMemoryConnector',
+    'buffer_size': 10 * 1024**3,  # 10GB
+    'use_cuda_ipc': True,  # GPU-GPU direct
+}
+# Latency: <1ms, Bandwidth: ~300 GB/s
+
+# Multi-node (InfiniBand)
+connector_config = {
+    'type': 'NixlConnector',  # NVIDIA NIXL
+    'async_mode': True,
+    'rdma_device': 'mlx5_0',
+}
+# Latency: 5-10ms, Bandwidth: 100-200 GB/s
+
+# Cross-datacenter
+connector_config = {
+    'type': 'TCPConnector',
+    'compression': 'zstd',  # ~3x compression
+    'buffer_size': 1 * 1024**3,
+}
+# Latency: 50-100ms (acceptable with async loading)
+```
+
+**4. Dynamic Prefill/Decode Ratio:**
+
+```python
+class MetaLoadBalancer:
+    """
+    Meta's dynamic resource allocation
+
+    Problem:
+    - Prefill load varies (burst vs steady)
+    - Fixed P:D ratio wastes resources
+
+    Solution:
+    - Monitor queue lengths
+    - Dynamically scale prefill/decode instances
+    - Use Kubernetes HPA or custom autoscaler
+    """
+
+    def compute_optimal_ratio(self, metrics):
+        """
+        Compute optimal prefill:decode GPU ratio
+
+        Inputs:
+        - prefill_queue_length: pending prefill requests
+        - decode_throughput: current decode tokens/sec
+        - avg_prompt_length: average prompt tokens
+        - avg_output_length: average output tokens
+        """
+        # Time to prefill one request
+        prefill_time = metrics.avg_prompt_length / metrics.prefill_throughput
+
+        # Time to decode one request
+        decode_time = metrics.avg_output_length / metrics.decode_throughput
+
+        # Optimal ratio = decode_time / prefill_time
+        # If decode takes longer → need more decode GPUs
+        optimal_ratio = decode_time / prefill_time
+
+        # Example:
+        # avg_prompt = 1000, prefill_throughput = 10000 tok/s → prefill_time = 0.1s
+        # avg_output = 500, decode_throughput = 500 tok/s → decode_time = 1s
+        # ratio = 1 / 0.1 = 10 → need 10x more decode GPUs
+
+        return optimal_ratio
+```
 
 #### Production Results (Meta, 2025)
 
@@ -4224,30 +5438,63 @@ vLLM đang phát triển các tính năng:
 
 ### Core vLLM
 
-1. **vLLM Paper**: "Efficient Memory Management for Large Language Model Serving with PagedAttention" (2023)
+1. **vLLM Paper**: "Efficient Memory Management for Large Language Model Serving with PagedAttention" - [arXiv:2309.06180](https://arxiv.org/abs/2309.06180) (2023)
 2. **vLLM GitHub**: https://github.com/vllm-project/vllm
-3. **vLLM Documentation**: https://vllm.readthedocs.io/
-4. **FlashAttention**: Efficient attention implementation (used in vLLM)
+3. **vLLM Documentation**: https://docs.vllm.ai/
+4. **vLLM Blog**: https://blog.vllm.ai/
+5. **FlashAttention**: Efficient attention implementation (used in vLLM)
+
+### vLLM V1 Architecture
+
+6. **vLLM V1 Alpha Release**: [vLLM V1: A Major Upgrade to vLLM's Core Architecture](https://blog.vllm.ai/2025/01/27/v1-alpha-release.html) (January 2025)
+7. **Inside vLLM: Anatomy of a High-Throughput LLM Inference System**: [vLLM Blog Technical Deep Dive](https://blog.vllm.ai/2025/09/05/anatomy-of-vllm.html)
+8. **vLLM V1 Engine Architecture RFC**: [GitHub Issue #8779](https://github.com/vllm-project/vllm/issues/8779)
+9. **vLLM 2024 Retrospective and 2025 Vision**: https://blog.vllm.ai/2025/01/10/vllm-2024-wrapped-2025-vision.html
+
+### Automatic Prefix Caching
+
+10. **vLLM Automatic Prefix Caching**: https://docs.vllm.ai/en/latest/design/automatic_prefix_caching.html
+11. **SGLang RadixAttention**: [Fast and Expressive LLM Inference with RadixAttention and SGLang](https://lmsys.org/blog/2024-01-17-sglang/)
+12. **Prefix Caching Comparison**: [SGLang vs vLLM - Token-Level Radix Tree vs Block-Level Hashing](https://medium.com/byte-sized-ai/prefix-caching-sglang-vs-vllm-token-level-radix-tree-vs-block-level-hashing-b99ece9977a1)
 
 ### Quantization
 
-5. **LLM Compressor**: https://github.com/vllm-project/llm-compressor
-6. **LLM Compressor Docs**: https://docs.vllm.ai/projects/llm-compressor
-7. **GPTQ Paper**: "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers" (2023)
-8. **AWQ Paper**: "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration" (2023)
-9. **SmoothQuant Paper**: "SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models" (2023)
-10. **SparseGPT Paper**: "SparseGPT: Massive Language Models Can Be Accurately Pruned in One-Shot" (2023)
+13. **LLM Compressor**: https://github.com/vllm-project/llm-compressor
+14. **LLM Compressor Docs**: https://docs.vllm.ai/projects/llm-compressor
+15. **GPTQ Paper**: "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers" (2023)
+16. **AWQ Paper**: "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration" (2023)
+17. **SmoothQuant Paper**: "SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models" (2023)
+18. **SparseGPT Paper**: "SparseGPT: Massive Language Models Can Be Accurately Pruned in One-Shot" (2023)
 
 ### Distributed Computing
 
-11. **Megatron-LM**: NVIDIA's framework for distributed training (inspiration for TP/PP)
-12. **FasterTransformer**: NVIDIA's optimized inference library
+19. **Megatron-LM**: NVIDIA's framework for distributed training (inspiration for TP/PP)
+20. **FasterTransformer**: NVIDIA's optimized inference library
+
+### Context Parallelism / Sequence Parallelism
+
+21. **Ring Attention Paper**: "Ring Attention with Blockwise Transformers for Near-Infinite Context" (Liu et al., 2023)
+22. **DeepSpeed Ulysses**: [Ultra-Long Sequence Parallelism: Ulysses + Ring-Attention Technical Principles](https://huggingface.co/blog/exploding-gradients/ulysses-ring-attention)
+23. **Snowflake Arctic Ulysses**: [Ulysses: Unlocking Low-Latency, High-Throughput Inference for Long-Context LLMs](https://www.snowflake.com/en/engineering-blog/ulysses-low-latency-llm-inference/)
+24. **Long Context Attention (USP)**: https://github.com/feifeibear/long-context-attention
+25. **vLLM Context Parallelism RFC**: [GitHub Issue #22693](https://github.com/vllm-project/vllm/issues/22693)
+26. **vLLM CP with Ring Attention RFC**: [GitHub Issue #26133](https://github.com/vllm-project/vllm/issues/26133)
+27. **vLLM Context Parallel Deployment**: https://docs.vllm.ai/en/latest/serving/context_parallel_deployment/
 
 ### Disaggregated Inference
 
-13. **Disaggregated Prefill vLLM Docs**: https://docs.vllm.ai/en/latest/features/disagg_prefill.html
-14. **PyTorch Blog - Disaggregated Inference**: https://pytorch.org/blog/disaggregated-inference-at-scale-with-pytorch-vllm/
-15. **Nexus Paper**: "Proactive Intra-GPU Disaggregation of Prefill and Decode in LLM Serving" (arXiv 2507.06608, 2025)
+28. **Disaggregated Prefill vLLM Docs**: https://docs.vllm.ai/en/latest/features/disagg_prefill.html
+29. **PyTorch Blog - Disaggregated Inference at Scale**: https://pytorch.org/blog/disaggregated-inference-at-scale-with-pytorch-vllm/
+30. **DistServe Paper**: "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving" (OSDI'24) - https://www.usenix.org/system/files/osdi24-zhong-yinmin.pdf
+31. **P/D-Serve Paper**: "P/D-Serve: Serving Disaggregated Large Language Model at Scale" - [arXiv:2408.08147](https://arxiv.org/html/2408.08147v1)
+32. **Nexus Paper**: "Proactive Intra-GPU Disaggregation of Prefill and Decode in LLM Serving" (arXiv 2507.06608, 2025)
+33. **vLLM Prefill-only optimizations RFC**: [GitHub Issue #19038](https://github.com/vllm-project/vllm/issues/19038)
+
+### Continuous Batching & Scheduling
+
+34. **Orca Paper**: "Orca: A Distributed Serving System for Transformer-Based Generative Models" (OSDI'22)
+35. **vLLM Chunked Prefill**: https://docs.vllm.ai/en/latest/configuration/optimization/
+36. **BatchLLM Paper**: "BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching" - [arXiv:2412.03594](https://arxiv.org/html/2412.03594v1)
 
 ---
 
